@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent friction</title>
+<style>
+:root {
+  --surface: #fcfcfb; --panel: #f4f3ef; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --empty: #efeee9; --critical: #d03b3b; --warning-ink: #8a5a00;
+  /* sequential blue, light -> dark = more time wasted */
+  --h1: #cde2fb; --h2: #86b6ef; --h3: #3987e5; --h4: #1c5cab; --h5: #0d366b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #1a1a19; --panel: #232321; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --empty: #262624; --critical: #e06a6a; --warning-ink: #fab219;
+    /* dark surface: near-zero recedes into the surface, more = lighter */
+    --h1: #104281; --h2: #1c5cab; --h3: #3987e5; --h4: #86b6ef; --h5: #cde2fb;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1280px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--ink2); margin: 0 0 16px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 20px; }
+.filters button, .filters select { font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--grid); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+.filters button[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.tile { background: var(--panel); border-radius: 8px; padding: 12px 14px; }
+.tile .k { color: var(--ink2); font-size: 12px; }
+.tile .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .n { color: var(--muted); font-size: 12px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 8px 6px; white-space: nowrap; }
+td { padding: 3px 8px; border-top: 1px solid var(--grid); vertical-align: middle; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.item { cursor: pointer; }
+tr.item:hover td { background: var(--panel); }
+.title { min-width: 240px; }
+.heat { display: flex; gap: 2px; }
+.cell { width: 16px; height: 20px; border-radius: 3px; background: var(--empty); flex: none; }
+.cell[data-l="1"] { background: var(--h1); } .cell[data-l="2"] { background: var(--h2); }
+.cell[data-l="3"] { background: var(--h3); } .cell[data-l="4"] { background: var(--h4); }
+.cell[data-l="5"] { background: var(--h5); }
+.cell:hover { outline: 2px solid var(--ink); outline-offset: 1px; }
+.axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+.badge { display: inline-block; font-size: 11px; border: 1px solid var(--grid); border-radius: 10px;
+  padding: 0 7px; margin-left: 6px; color: var(--ink2); white-space: nowrap; }
+.badge.est { border-color: var(--warning-ink); color: var(--warning-ink); }
+.badge.reg { border-color: var(--critical); color: var(--critical); }
+.legend { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+.legend .cell { width: 14px; height: 14px; }
+.detail td { background: var(--panel); padding: 12px 16px; }
+.detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0 0 10px; }
+.detail dt { color: var(--muted); } .detail dd { margin: 0; white-space: pre-wrap; }
+.occ { border-top: 1px solid var(--grid); padding: 6px 0; }
+.occ .meta { color: var(--ink2); }
+pre { margin: 4px 0 0; font: 12px/1.4 ui-monospace, monospace; color: var(--ink2); white-space: pre-wrap; word-break: break-word; }
+pre .fail { color: var(--critical); }
+#tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--surface);
+  padding: 5px 8px; border-radius: 5px; font-size: 12px; display: none; z-index: 5; white-space: nowrap; }
+.facets { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 24px; margin-top: 28px; }
+.facets h2 { font-size: 13px; color: var(--ink2); font-weight: 500; margin: 0 0 6px; }
+.bar { display: grid; grid-template-columns: 130px 1fr max-content; gap: 8px; align-items: center; padding: 2px 0; }
+.bar .track { height: 10px; }
+.bar .fill { height: 10px; background: var(--h3); border-radius: 0 4px 4px 0; min-width: 2px; }
+.bar .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar .val { color: var(--ink2); font-variant-numeric: tabular-nums; font-size: 12px; }
+.empty { color: var(--muted); padding: 32px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Agent friction</h1>
+  <p class="sub" id="sub">What cost agents time, by day. Darkness of a cell = time wasted that day.</p>
+  <div class="filters">
+    <span id="ranges"></span>
+    <select id="project" aria-label="Project"></select>
+    <select id="agent" aria-label="Agent"></select>
+  </div>
+  <div class="tiles" id="tiles"></div>
+  <div class="scroll"><table id="table"></table></div>
+  <div class="legend" id="legend"></div>
+  <div class="facets" id="facets"></div>
+</main>
+<div id="tip"></div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dur = s => { if (s == null) return '–'; s = Math.round(s);
+  return s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm ' + String(s%60).padStart(2,'0') + 's'
+    : Math.floor(s/3600) + 'h ' + String(Math.floor(s%3600/60)).padStart(2,'0') + 'm'; };
+const when = ts => new Date(ts * 1000).toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+const state = {days: 14, project: '', agent: '', open: null};
+const RANGES = [[7,'7 days'],[14,'14 days'],[30,'30 days'],[90,'90 days']];
+
+function level(v, peak) { return v <= 0 ? 0 : Math.min(5, 1 + Math.floor(4 * Math.sqrt(v / peak))); }
+
+async function load() {
+  const q = new URLSearchParams({days: state.days, project: state.project, agent: state.agent});
+  const rep = await (await fetch('/api/report?' + q)).json();
+  render(rep);
+}
+
+function render(rep) {
+  $('ranges').innerHTML = RANGES.map(([d, l]) =>
+    `<button data-days="${d}" aria-pressed="${d === state.days}">${l}</button>`).join(' ');
+  for (const [id, key, all] of [['project','projects','All projects'],['agent','agents','All agents']]) {
+    const names = rep[key].map(r => r.name).filter(Boolean);
+    if (state[id] && !names.includes(state[id])) names.push(state[id]);
+    $(id).innerHTML = `<option value="">${all}</option>` + names.map(n =>
+      `<option ${n === state[id] ? 'selected' : ''}>${esc(n)}</option>`).join('');
+  }
+  const t = rep.total, top = rep.items[0];
+  const estNote = t.estimated ? `${t.estimated} estimated (${dur(t.wasted_estimated_s)})` : 'all measured';
+  $('tiles').innerHTML = [
+    ['Time wasted', dur(t.wasted_s), estNote + (t.untimed ? `, ${t.untimed} untimed` : '')],
+    ['Occurrences', t.occurrences, `across ${t.items} items`],
+    ['Costliest', top ? dur(top.wasted) : '–', top ? esc(top.title) : 'nothing logged'],
+    ['Regressions', t.regressed, 'hits on resolved items'],
+  ].map(([k, v, n]) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${n}</div></div>`).join('');
+
+  if (!rep.items.length) {
+    $('table').innerHTML = '<tr><td class="empty">No friction logged in this window.</td></tr>';
+    $('legend').innerHTML = $('facets').innerHTML = '';
+    return;
+  }
+  const peak = Math.max(1, ...rep.items.flatMap(it => Object.values(it.days).map(d => d.wasted || d.n)));
+  const dl = rep.day_list, short = d => d.slice(5);
+  let html = `<tr><th>Item</th><th class="num">Hits</th><th class="num">Wasted</th><th class="num">Avg</th>
+    <th><div class="axis"><span>${short(dl[0])}</span><span>${short(dl[dl.length-1])}</span></div></th></tr>`;
+  for (const it of rep.items) {
+    const cells = dl.map(d => { const c = it.days[d];
+      const tip = c ? `${short(d)}: ${c.n} hit${c.n > 1 ? 's' : ''}, ${dur(c.wasted)} wasted` : `${short(d)}: none`;
+      return `<div class="cell" data-l="${c ? level(c.wasted || c.n, peak) : 0}" data-tip="${esc(tip)}"></div>`; }).join('');
+    const badges = (it.estimated ? `<span class="badge est" title="Wasted time for these occurrences is the agent's estimate, not measured from tool events">~ ${it.estimated} estimated</span>` : '')
+      + (it.untimed ? `<span class="badge">${it.untimed} untimed</span>` : '')
+      + (it.regressed ? `<span class="badge reg">↺ regressed</span>` : '')
+      + (it.status !== 'open' ? `<span class="badge">${esc(it.status)}</span>` : '');
+    html += `<tr class="item" data-id="${it.id}"><td class="title">#${it.id} ${esc(it.title)}${badges}</td>
+      <td class="num">${it.n}</td><td class="num">${dur(it.wasted)}</td><td class="num">${dur(it.avg_wasted)}</td>
+      <td><div class="heat">${cells}</div></td></tr>
+      <tr class="detail" id="d${it.id}" hidden><td colspan="5"></td></tr>`;
+  }
+  $('table').innerHTML = html;
+  $('legend').innerHTML = 'less time ' + [0,1,2,3,4,5].map(l => `<div class="cell" data-l="${l}"></div>`).join('') + ' more time wasted per day';
+  $('facets').innerHTML = [['By project', rep.projects], ['By agent', rep.agents]].map(([h, rows]) => {
+    const max = Math.max(1, ...rows.map(r => r.wasted || r.n));
+    return `<div><h2>${h} — time wasted</h2>` + rows.slice(0, 8).map(r =>
+      `<div class="bar"><span class="lab">${esc(r.name || 'unknown')}</span>
+       <div class="track"><div class="fill" style="width:${100 * (r.wasted || 0) / max}%"></div></div>
+       <span class="val">${dur(r.wasted)} · ${r.n}×</span></div>`).join('') + '</div>'; }).join('');
+  if (state.open) toggle(state.open, true);
+}
+
+async function toggle(id, keep) {
+  const row = $('d' + id);
+  if (!row) { state.open = null; return; }
+  if (!keep && !row.hidden) { row.hidden = true; state.open = null; return; }
+  state.open = id;
+  const d = await (await fetch('/api/item?id=' + id)).json(), it = d.item;
+  const occ = d.occurrences.map(o => {
+    const flag = o.timing === 'estimate' ? '<span class="badge est">~ estimated</span>'
+      : o.timing === 'none' ? '<span class="badge">untimed</span>'
+      : `<span class="badge">measured: ${o.timing}</span>`;
+    const ev = o.events.map(e => `<span class="${e.ok === 0 ? 'fail' : ''}">${e.ok === 0 ? 'FAIL' : 'ok  '} ${esc(e.tool)}: ${esc((e.summary || '').slice(0, 160))}${e.ok === 0 && e.error ? '\n       → ' + esc(e.error.slice(0, 200)) : ''}</span>`).join('\n');
+    return `<div class="occ"><div class="meta">${when(o.ts)} · ${esc(o.agent || '?')} / ${esc(o.project || '?')} · <b>${dur(o.wasted_s)}</b>${flag}
+      ${o.regression ? '<span class="badge reg">↺ regression</span>' : ''}${o.source === 'backfill' ? '<span class="badge">backfilled</span>' : ''}
+      ${o.tool_calls != null ? ` · ${o.tool_calls} calls, ${o.failed_calls} failed` : ''}</div>
+      ${o.note ? `<div>${esc(o.note)}</div>` : ''}${ev ? `<pre>${ev}</pre>` : ''}</div>`; }).join('');
+  row.firstElementChild.innerHTML = `<dl>
+    ${it.detail ? `<dt>Detail</dt><dd>${esc(it.detail)}</dd>` : ''}
+    <dt>Workaround</dt><dd>${esc(it.workaround) || '—'}</dd>
+    ${it.fix_note ? `<dt>Fix</dt><dd>${esc(it.fix_note)}</dd>` : ''}
+    ${it.aliases ? `<dt>Also known as</dt><dd>${esc(it.aliases)}</dd>` : ''}
+    <dt>All time</dt><dd>${d.stats.n} hits in ${d.stats.sessions} sessions, ${dur(d.stats.wasted)} wasted, ${it.regressions} regressions</dd></dl>${occ}`;
+  row.hidden = false;
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('button[data-days]');
+  if (b) { state.days = +b.dataset.days; return load(); }
+  const r = e.target.closest('tr.item');
+  if (r) toggle(+r.dataset.id);
+});
+for (const id of ['project', 'agent']) $(id).addEventListener('change', e => { state[id] = e.target.value; load(); });
+document.addEventListener('mousemove', e => {
+  const c = e.target.closest('[data-tip]'), tip = $('tip');
+  if (!c) { tip.style.display = 'none'; return; }
+  tip.textContent = c.dataset.tip; tip.style.display = 'block';
+  tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + 'px';
+  tip.style.top = (e.clientY - 34) + 'px';
+});
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>
