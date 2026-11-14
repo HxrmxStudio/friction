@@ -1,9 +1,9 @@
 ---
-name: agent-friction
+name: friction
 description: Log, upvote and look up friction that wastes agent time on this machine (failed or invalid commands, missing credentials, auth timeouts, tool errors, detours) with the local `friction` CLI. Use when something costs you turns, when a hook asks whether recent failures were friction, when the user asks what slows agents down, or to check for a known workaround before retrying a failing tool.
 ---
 
-# agent-friction
+# friction
 
 A shared local log of what slows agents down. Every agent on this machine writes to the same
 SQLite database, so one agent's discovery (and workaround) reaches the next. Hooks record tool

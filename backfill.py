@@ -143,7 +143,7 @@ def parse_codex(path):
 def transcripts(since_ts, now):
     """(path, agent, mtime) for transcripts touched in the window and idle since."""
     home = Path.home()
-    skip = '-local-share-agent-friction'      # the analyser's own working directory
+    skip = '-local-share-friction'      # the analyser's own working directory
     found = []
     for agent, pattern in (('claude', '.claude/projects/*/*.jsonl'),
                            ('codex', '.codex/sessions/*/*/*/*.jsonl')):
@@ -225,9 +225,9 @@ def build_prompt(fr, session, text):
 def analyse(prompt, model):
     """Run the headless analyser. -> list of findings (raises on failure)."""
     exe = shutil.which('claude') or str(Path.home() / '.local/bin/claude')
-    workdir = Path.home() / '.local/share/agent-friction/analyser'
+    workdir = Path.home() / '.local/share/friction/analyser'
     workdir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, AGENT_FRICTION_DISABLE='1')
+    env = dict(os.environ, FRICTION_DISABLE='1')
     for key in ('CLAUDE_CODE_SESSION_ID', 'CLAUDECODE', 'AGENT_MAILBOX_ID', 'HC_TERMINAL_ID'):
         env.pop(key, None)
     proc = subprocess.run(

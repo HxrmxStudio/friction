@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agent-friction: a small shared log of what slows agents down.
+"""friction: a small shared log of what slows agents down.
 
 Agents record friction items (a bad command, a missing credential, an auth
 timeout), upvote ones another agent already found, and attach workarounds.
@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_DIR = '~/.local/share/agent-friction'
+DEFAULT_DIR = '~/.local/share/friction'
 SUMMARY_MAX = 500
 EVENT_RETENTION_DAYS = 30
 STREAK_GAP_S = 600          # failures further apart than this are separate streaks
@@ -194,7 +194,7 @@ def fmt_ts(ts, fmt='%Y-%m-%d %H:%M'):
 
 class Friction:
     def __init__(self, root=None):
-        root = root or os.environ.get('AGENT_FRICTION_DIR') or DEFAULT_DIR
+        root = root or os.environ.get('FRICTION_DIR') or DEFAULT_DIR
         self.root = Path(root).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.root / 'friction.db', timeout=5)
@@ -286,7 +286,7 @@ class Friction:
 
     def guess_session(self, env=os.environ, cwd=None, now=None):
         """Which session is calling the CLI: env first, else our own in-flight Bash call."""
-        for key in ('AGENT_FRICTION_SESSION', 'CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID',
+        for key in ('FRICTION_SESSION', 'CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID',
                     'CODEX_THREAD_ID'):
             if env.get(key):
                 return env[key]
@@ -826,7 +826,7 @@ def cmd_backfill(fr, args):
 
 def cmd_web(fr, args):
     import web
-    print(f'agent-friction web view: http://{args.host}:{args.port}  (ctrl-c to stop)')
+    print(f'friction web view: http://{args.host}:{args.port}  (ctrl-c to stop)')
     try:
         web.serve(args.host, args.port)
     except KeyboardInterrupt:

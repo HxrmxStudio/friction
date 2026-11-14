@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install, update or remove agent-friction for the current user.
+"""Install, update or remove friction for the current user.
 
   python3 installer.py                 install or update (safe to re-run)
   python3 installer.py --dry-run       show what would change
@@ -25,9 +25,9 @@ HOME = Path.home()
 HOOK_MARK = 'friction_hook.py'
 CLAUDE_EVENTS = ('SessionStart', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop')
 CODEX_EVENTS = ('SessionStart', 'PreToolUse', 'PostToolUse', 'Stop')
-UNITS = ('agent-friction-web.service', 'agent-friction-backfill.service',
-         'agent-friction-backfill.timer')
-ENABLE = ('agent-friction-web.service', 'agent-friction-backfill.timer')
+UNITS = ('friction-web.service', 'friction-backfill.service',
+         'friction-backfill.timer')
+ENABLE = ('friction-web.service', 'friction-backfill.timer')
 
 DRY = False
 
@@ -118,7 +118,7 @@ def skill_dirs():
         real = skills.resolve()
         if real not in seen:
             seen.add(real)
-            dirs.append(skills / 'agent-friction')
+            dirs.append(skills / 'friction')
     return dirs
 
 
@@ -126,19 +126,19 @@ def skill_dirs():
 
 def unit_text(name, port):
     py, app = sys.executable, APP
-    if name == 'agent-friction-web.service':
-        return (f'[Unit]\nDescription=Agent friction web view (read-only, 127.0.0.1:{port})\n\n'
+    if name == 'friction-web.service':
+        return (f'[Unit]\nDescription=Friction web view (read-only, 127.0.0.1:{port})\n\n'
                 f'[Service]\nExecStart="{py}" "{app}/web.py" --port {port}\nRestart=on-failure\n\n'
                 '[Install]\nWantedBy=default.target\n')
-    if name == 'agent-friction-backfill.service':
+    if name == 'friction-backfill.service':
         claude = shutil.which('claude')
         path = os.pathsep.join(dict.fromkeys(
             ([str(Path(claude).parent)] if claude else [])
             + [str(HOME / '.local/bin'), '/usr/local/bin', '/usr/bin', '/bin']))
-        return ("[Unit]\nDescription=Agent friction: mine the day's transcripts for unlogged friction\n\n"
+        return ("[Unit]\nDescription=Friction: mine the day's transcripts for unlogged friction\n\n"
                 f'[Service]\nType=oneshot\nEnvironment=PATH={path}\n'
                 f'ExecStart="{py}" "{app}/friction.py" backfill --since 2d\n')
-    return ('[Unit]\nDescription=Nightly agent friction backfill\n\n'
+    return ('[Unit]\nDescription=Nightly friction backfill\n\n'
             '[Timer]\nOnCalendar=*-*-* 03:30:00\nPersistent=true\n\n'
             '[Install]\nWantedBy=timers.target\n')
 
@@ -176,7 +176,7 @@ def services(args):
     for name in ENABLE:
         systemctl('enable', '--now', name)
     if changed:
-        systemctl('restart', 'agent-friction-web.service')
+        systemctl('restart', 'friction-web.service')
     say(f'web view http://127.0.0.1:{args.port}')
 
 
@@ -199,11 +199,11 @@ def remove_services():
 
 def check():
     if sys.version_info < (3, 8):
-        sys.exit(f'agent-friction needs Python 3.8+, this is {sys.version.split()[0]}')
+        sys.exit(f'friction needs Python 3.8+, this is {sys.version.split()[0]}')
     try:
         sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')
     except sqlite3.OperationalError:
-        sys.exit('agent-friction needs SQLite with FTS5, which this Python build lacks')
+        sys.exit('friction needs SQLite with FTS5, which this Python build lacks')
 
 
 def main():
@@ -231,7 +231,7 @@ def main():
             hooks(args, remove=True)
         if not args.no_services:
             remove_services()
-        say('Uninstalled. Your data is still in ~/.local/share/agent-friction (delete it to forget).')
+        say('Uninstalled. Your data is still in ~/.local/share/friction (delete it to forget).')
         return 0
 
     check()

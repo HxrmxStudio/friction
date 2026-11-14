@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🪨 agent-friction
+# 🪨 friction
 
 **Find out what is wasting your coding agents' time, and make them tell each other how to get past it.**
 
@@ -12,7 +12,7 @@
 
 [Install](#install) · [How it works](#how-it-works) · [Commands](#commands) · [Privacy](#privacy) · [Uninstall](#uninstall)
 
-<img src="docs/web.png" alt="The agent-friction web view: a heatmap of friction items by day, with time wasted per item, project and agent" width="860">
+<img src="docs/web.png" alt="The friction web view: a heatmap of friction items by day, with time wasted per item, project and agent" width="860">
 
 </div>
 
@@ -22,7 +22,7 @@ Agents lose a surprising amount of time to things that have nothing to do with t
 token, a command that needs quoting in your shell, a port a stale container still holds. Each new
 session rediscovers the same problem and pays for it again.
 
-agent-friction is a small local log of those problems. Hooks time every tool call, agents name the
+friction is a small local log of those problems. Hooks time every tool call, agents name the
 friction they hit and upvote the ones already known, and every new session starts with the current
 worst offenders and their workarounds. You get a heatmap of where the time goes.
 
@@ -41,7 +41,7 @@ Needs `python3` (3.8+) and `git`. Linux and macOS.
 
 The installer is safe to re-run, and re-running it updates. It:
 
-1. clones the repo to `~/.local/share/agent-friction/app`
+1. clones the repo to `~/.local/share/friction/app`
 2. links the `friction` command into `~/.local/bin`
 3. links the agent skill into `~/.agents/skills`, `~/.claude/skills` and `~/.codex/skills`
 4. adds the hook to `~/.claude/settings.json` and `~/.codex/hooks.json` (merged with what is there, with a `.bak` copy saved first)
@@ -160,7 +160,7 @@ reopens it and counts as a regression.
 
 ## Privacy
 
-Everything stays on your machine, in `~/.local/share/agent-friction/friction.db`.
+Everything stays on your machine, in `~/.local/share/friction/friction.db`.
 
 - Tool input and error text are cut to 500 characters and scrubbed of obvious secrets (tokens,
   keys, passwords in URLs) before they are stored. Treat this as a safety net, not a guarantee.
@@ -173,8 +173,8 @@ Everything stays on your machine, in `~/.local/share/agent-friction/friction.db`
 
 | Variable | Effect |
 |---|---|
-| `AGENT_FRICTION_DIR` | where the database lives (default `~/.local/share/agent-friction`) |
-| `AGENT_FRICTION_DISABLE=1` | switch the hook off for a process tree |
+| `FRICTION_DIR` | where the database lives (default `~/.local/share/friction`) |
+| `FRICTION_DISABLE=1` | switch the hook off for a process tree |
 
 Hooks are registered for `SessionStart`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` and
 `Stop`. The hook exits 0 on any error, so it cannot break an agent session.
@@ -182,11 +182,11 @@ Hooks are registered for `SessionStart`, `PreToolUse`, `PostToolUse`, `PostToolU
 ## Uninstall
 
 ```sh
-~/.local/share/agent-friction/app/install.sh --uninstall
+~/.local/share/friction/app/install.sh --uninstall
 ```
 
 This removes the links, the hook entries and the services. Your database is left in place. Delete
-`~/.local/share/agent-friction` to remove that too.
+`~/.local/share/friction` to remove that too.
 
 ## Development
 
@@ -210,5 +210,5 @@ same five events to `friction_hook.py`.
 
 [GPL-3.0-or-later](LICENSE). Copyright © 2026 Martin Wheeler.
 
-You may use, copy, modify and share agent-friction. If you distribute it, or a modified version,
+You may use, copy, modify and share friction. If you distribute it, or a modified version,
 you must do so under the same license and make the source available.

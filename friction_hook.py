@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code / Codex hook for agent-friction.
+"""Claude Code / Codex hook for friction.
 
 Registered for SessionStart, PreToolUse, PostToolUse, PostToolUseFailure and
 Stop (Claude: ~/.claude/settings.json, Codex: ~/.codex/hooks.json; pass
@@ -13,7 +13,7 @@ Stop (Claude: ~/.claude/settings.json, Codex: ~/.codex/hooks.json; pass
 
 Tool input and errors are truncated and scrubbed of obvious secrets before
 they are stored. Any error exits 0 silently: this must never break an agent.
-Set AGENT_FRICTION_DISABLE=1 to switch it off for a process tree.
+Set FRICTION_DISABLE=1 to switch it off for a process tree.
 """
 import json
 import os
@@ -88,7 +88,7 @@ def failed(event):
 
 def start_context(fr):
     lines = [
-        'agent-friction is installed: a shared log of things that waste agent time (bad commands,'
+        'friction is installed: a shared log of things that waste agent time (bad commands,'
         ' missing credentials, auth timeouts, tool errors, detours). When something costs you turns,'
         ' run `friction log "<short name of the underlying problem>" --detail "..."`; it lists'
         ' similar existing items so you can `friction bump <id>` instead. Add `--workaround "..."`'
@@ -107,7 +107,7 @@ def start_context(fr):
 
 def nudge_text(fails):
     tools = ', '.join(dict.fromkeys(ev['tool'] or '?' for ev in fails))
-    return (f'agent-friction: {len(fails)} tool calls failed this session ({tools}) and none were'
+    return (f'friction: {len(fails)} tool calls failed this session ({tools}) and none were'
             ' logged. If any of that was real friction (wasted turns, a missing credential, a bad'
             ' command, a detour), record it now: `friction log "<problem>" --detail "..."`, or'
             ' `friction bump <id>` for a known one; `friction timeline` shows the calls. If it was'
@@ -156,7 +156,7 @@ def handle(event, fr, agent):
 
 def main():
     try:
-        if os.environ.get('AGENT_FRICTION_DISABLE'):
+        if os.environ.get('FRICTION_DISABLE'):
             return 0
         agent = 'claude'
         if '--agent' in sys.argv:

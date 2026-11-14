@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for agent-friction. Run: python3 -m unittest -v test_friction"""
+"""Tests for friction. Run: python3 -m unittest -v test_friction"""
 import json
 import tempfile
 import unittest
