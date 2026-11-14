@@ -16,13 +16,19 @@ Configuration is an INI file, ~/.config/friction/config.ini (FRICTION_CONFIG
 overrides the path):
 
   [tracker]
+  enabled = true
   type = jira
   url = https://yoursite.atlassian.net
   email = you@example.com
   project = FRIC
   token_file = ~/.config/friction/jira-token     ; or token_env / token_cmd
   ; optional: issue_type = Task, label = friction, cloud_id = <id> (scoped tokens)
+
+Sync is off unless `enabled = true`. `friction sync --enable` writes a template
+the first time, and afterwards switches it on once the tracker answers;
+`friction sync --disable` switches it off again.
 """
+import atexit
 import base64
 import collections
 import configparser
@@ -59,17 +65,61 @@ def config_path():
     return Path(base).expanduser() / 'friction' / 'config.ini'
 
 
-def load_config():
-    """The [tracker] section as a dict, or None when no tracker is configured."""
+TEMPLATE = """\
+# friction tracker sync. Fill in the values, then run: friction sync --enable
+[tracker]
+enabled = false
+type = jira
+url = https://yoursite.atlassian.net
+email = you@example.com
+project = FRIC
+token_file = ~/.config/friction/jira-token
+"""
+
+
+def read_config():
+    """The [tracker] section as a dict (empty when there is none), whether or not it is enabled."""
     path = config_path()
     if not path.exists():
-        return None
+        return {}
     parser = configparser.ConfigParser(inline_comment_prefixes=(';',))
-    parser.read(path)
-    if not parser.has_section('tracker'):
+    try:
+        parser.read(path)
+    except configparser.Error as exc:
+        raise TrackerError(f'{path}: {exc}') from None
+    return dict(parser['tracker']) if parser.has_section('tracker') else {}
+
+
+def is_enabled(cfg):
+    return cfg.get('enabled', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def load_config():
+    """The tracker settings, or None when sync is off. Sync is off unless `enabled = true`."""
+    try:
+        cfg = read_config()
+    except TrackerError:
         return None
-    cfg = dict(parser['tracker'])
-    return cfg if cfg.get('type', 'none').lower() not in ('', 'none') else None
+    return cfg if is_enabled(cfg) else None
+
+
+def set_enabled(on):
+    """Flip `enabled` in the config file, leaving every other line as the user wrote it."""
+    path = config_path()
+    lines = path.read_text().splitlines()
+    value = f"enabled = {'true' if on else 'false'}"
+    section, header, done = None, None, False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('['):
+            section = stripped.strip('[]').strip().lower()
+            if section == 'tracker':
+                header = i
+        elif section == 'tracker' and re.match(r'enabled\s*[=:]', stripped, re.I):
+            lines[i], done = value, True
+    if not done:
+        lines.insert(header + 1, value)
+    path.write_text('\n'.join(lines) + '\n')
 
 
 def read_token(cfg):
@@ -443,16 +493,58 @@ def locked(fr):
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return False
-    locked.handle = handle
+    atexit.register(handle.close)       # keep it open, and so locked, until the process ends
     return True
+
+
+def enable(fr):
+    """Turn sync on, but only once the settings are complete and the tracker answers."""
+    path = config_path()
+    cfg = read_config()
+    if not cfg:
+        if path.exists():
+            raise TrackerError(f'{path} has no [tracker] section')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(TEMPLATE)
+        path.chmod(0o600)
+        print(f'Wrote a template to {path}.\nFill in your site, email and project, put an API token'
+              ' in the token file, then run `friction sync --enable` again.')
+        return 1
+    if 'yoursite.atlassian.net' in cfg.get('url', ''):
+        raise TrackerError(f'{path} still has the template values; fill them in first')
+    who = make_tracker(cfg).check()            # raises if the settings or the token are wrong
+    set_enabled(True)
+    todo = pending(fr)
+    print(f'Tracker sync is ON. Connected: {who}')
+    print('The next `friction sync` will push: ' + ', '.join(f'{n} {k}' for k, n in todo.items()))
+    return 0
+
+
+def disable():
+    if not read_config():
+        print('Tracker sync is already off (nothing configured).')
+        return 0
+    set_enabled(False)
+    print('Tracker sync is OFF. Items stay local; anything already in the tracker is left there.\n'
+          'Changes made while it is off are sent if you enable it again.')
+    return 0
 
 
 def run(fr, args):
     say = (lambda *a: None) if args.quiet else print
-    cfg = load_config()
+    try:
+        if args.enable:
+            return enable(fr)
+        if args.disable:
+            return disable()
+        raw = read_config()
+    except TrackerError as exc:
+        print(f'friction sync: {exc}', file=sys.stderr)
+        return 1
+    cfg = raw if (is_enabled(raw) or (args.check and raw)) else None
     if cfg is None:
-        say(f'No tracker configured. Items stay local. To sync with Jira, create {config_path()}'
-            ' (see the README).')
+        say('Tracker sync is off: items stay in the local database. Turn it on with'
+            ' `friction sync --enable`.')
         return 0
     todo = pending(fr)
     if args.dry_run:
@@ -461,6 +553,7 @@ def run(fr, args):
     try:
         tr = make_tracker(cfg)
         if args.check:
+            print(f"Tracker sync is {'ON' if is_enabled(cfg) else 'OFF (enable with `friction sync --enable`)'}.")
             print('Connected: ' + tr.check())
             print('Pending: ' + ', '.join(f'{n} {k}' for k, n in todo.items()))
             if fr.meta('sync_error'):

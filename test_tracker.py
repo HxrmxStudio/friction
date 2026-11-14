@@ -213,6 +213,49 @@ class TrackerTest(unittest.TestCase):
         self.assertFalse(self.jira.issues['FRIC-1']['done'])
         self.assertEqual(len(self.jira.issues['FRIC-1']['comments']), 1)
 
+    def test_sync_is_off_until_enabled(self):
+        import argparse
+        import contextlib
+        import io
+        path = Path(self.tmp.name) / 'config.ini'
+        os.environ['FRICTION_CONFIG'] = str(path)
+        self.addCleanup(os.environ.pop, 'FRICTION_CONFIG', None)
+
+        def run(**flags):
+            args = argparse.Namespace(enable=False, disable=False, check=False, dry_run=False, quiet=False)
+            vars(args).update(flags)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = tracker.run(self.a, args)
+            return code, out.getvalue()
+
+        item = self.a.create('npm proxy timeout', '', '')
+        self.a.occur(item, estimate_s=5)
+        self.assertIsNone(tracker.load_config())                       # nothing configured: off
+        self.assertIn('off', run()[1])
+        self.assertEqual(run(enable=True)[0], 1)                       # first enable writes a template
+        self.assertIn('enabled = false', path.read_text())
+        self.assertEqual(run(enable=True)[0], 1)                       # template values: refused
+        path.write_text('# my settings\n[tracker]\ntype = jira\n'
+                        + ''.join(f'{k} = {v}\n' for k, v in self.cfg.items() if k != 'type'))
+        self.assertIsNone(tracker.load_config())                       # complete but not enabled: off
+        run()
+        self.assertEqual(self.jira.writes, 0)
+        self.jira.down = True
+        self.assertEqual(run(enable=True)[0], 1)                       # unreachable: stays off
+        self.assertIsNone(tracker.load_config())
+        self.jira.down = False
+        self.assertEqual(run(enable=True)[0], 0)
+        self.assertIn('# my settings', path.read_text())               # the user's file is preserved
+        self.assertEqual(run()[0], 0)
+        self.assertEqual(len(self.jira.issues), 1)
+        self.assertEqual(run(disable=True)[0], 0)
+        self.assertIsNone(tracker.load_config())
+        self.a.occur(item, estimate_s=5)
+        writes = self.jira.writes
+        run()
+        self.assertEqual(self.jira.writes, writes)                     # off: nothing is sent
+
     def test_hit_comment_round_trips_awkward_text(self):
         occ = {'uid': 'abc123', 'ts': 1700000000.7, 'timing': 'hook', 'wasted_s': 61.9,
                'agent': 'claude', 'project': 'my app [v2] = x', 'note': 'line one\nline ] two'}

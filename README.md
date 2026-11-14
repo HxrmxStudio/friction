@@ -145,7 +145,7 @@ Agents run these themselves, guided by the bundled skill. They work just as well
 | `friction report [--week\|--month] [--project P] [--agent A] [--json]` | heatmap |
 | `friction backfill --since 30d [--dry-run]` | mine past transcripts |
 | `friction web [--port N]` | serve the web view |
-| `friction sync [--check\|--dry-run]` | sync items with Jira, if configured |
+| `friction sync [--enable\|--disable\|--check\|--dry-run]` | sync items with Jira (off by default) |
 
 ### Where the time comes from
 
@@ -173,9 +173,17 @@ fast work (timing, duplicate search, the heatmap).
 > workflow, and CI tests it against a fake Jira. Custom workflows and required fields may need
 > changes; please open an issue if yours does.
 
+**Sync is off by default.** Nothing is sent anywhere until you turn it on:
+
+```sh
+friction sync --enable    # first run: writes a template to ~/.config/friction/config.ini
+```
+
+Fill in the template:
+
 ```ini
-# ~/.config/friction/config.ini
 [tracker]
+enabled = false
 type = jira
 url = https://yoursite.atlassian.net
 email = you@example.com
@@ -183,13 +191,25 @@ project = FRIC
 token_file = ~/.config/friction/jira-token
 ```
 
-Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>, put it in
-that file as the only line, and `chmod 600` it. Then:
+Create a personal API token at <https://id.atlassian.com/manage-profile/security/api-tokens> (it
+starts with `ATATT`; an organisation admin API key will not work), put it in the token file as
+the only line, and `chmod 600` it. Then:
 
 ```sh
-friction sync --check     # test the connection, show what is waiting
+friction sync --enable    # checks the connection, then switches sync on
+friction sync --dry-run   # what the first sync would send
 friction sync             # pull, then push
 ```
+
+`--enable` only switches sync on if Jira answers with those settings, and says what the next sync
+will push. Your first sync creates an issue for every existing item.
+
+```sh
+friction sync --check     # is it on? does the connection work? what is waiting?
+friction sync --disable   # switch it off; items stay local, issues already in Jira are left
+```
+
+Changes made while sync is off are kept and sent if you enable it again.
 
 | In friction | In Jira |
 |---|---|
@@ -221,14 +241,14 @@ list and duplicate search.
 | `label` | `friction` | label that marks issues as friction items |
 | `cloud_id` | | required for scoped API tokens; routes calls through `api.atlassian.com` |
 
-`FRICTION_CONFIG` overrides the config file path. To stop syncing, delete the file or set
-`type = none`; items already in Jira stay there.
+`FRICTION_CONFIG` overrides the config file path. `enabled = true` or `false` in the file is the
+switch that `--enable` and `--disable` flip; you can also edit it by hand.
 
 </details>
 
 ## Privacy
 
-Unless you configure a tracker, everything stays on your machine, in
+Unless you enable tracker sync, everything stays on your machine, in
 `~/.local/share/friction/friction.db`.
 
 - Tool input and error text are cut to 500 characters and scrubbed of obvious secrets (tokens,
@@ -237,7 +257,8 @@ Unless you configure a tracker, everything stays on your machine, in
 - The web view is read-only and listens on `127.0.0.1` only.
 - `friction backfill` sends transcript excerpts to the model through your own `claude` CLI. Do not
   enable the timer if you do not want that.
-- [Jira sync](#sync-with-jira), if you configure it, sends items and occurrences to your Jira site.
+- [Jira sync](#sync-with-jira) is off by default. If you enable it, items and occurrences are sent
+  to your Jira site.
 - Nothing else makes a network request.
 
 ## Configuration

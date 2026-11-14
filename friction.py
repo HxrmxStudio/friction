@@ -883,8 +883,8 @@ def kick_sync():
     try:
         import subprocess
         import tracker
-        if not tracker.config_path().exists():
-            return
+        if not tracker.config_path().exists() or tracker.load_config() is None:
+            return                                  # sync is off unless explicitly enabled
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'sync', '--quiet'],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
@@ -993,7 +993,10 @@ def build_parser():
     p.add_argument('--redo', action='store_true', help='re-analyse sessions already processed')
     p.set_defaults(fn=cmd_backfill)
 
-    p = sub.add_parser('sync', help='sync items with the configured tracker (e.g. Jira)')
+    p = sub.add_parser('sync', help='sync items with an issue tracker such as Jira (off by default)')
+    p.add_argument('--enable', action='store_true',
+                   help='turn tracker sync on (writes a config template the first time)')
+    p.add_argument('--disable', action='store_true', help='turn tracker sync off; items stay local')
     p.add_argument('--check', action='store_true', help='test the connection and show what is pending')
     p.add_argument('--dry-run', action='store_true', help='show what would be pushed, change nothing')
     p.add_argument('--quiet', action='store_true', help='no output unless something fails')
