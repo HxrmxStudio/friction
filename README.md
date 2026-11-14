@@ -37,7 +37,8 @@ worst offenders and their workarounds. You get a heatmap of where the time goes.
 curl -fsSL https://raw.githubusercontent.com/martinwheeler/friction/main/install.sh | bash
 ```
 
-Needs `python3` (3.8+) and `git`. Linux and macOS.
+Needs `python3` and `git`. Linux and macOS. CI covers Python 3.11 and newer; 3.8 to 3.10 should
+work but are not tested.
 
 The installer is safe to re-run, and re-running it updates. It:
 
