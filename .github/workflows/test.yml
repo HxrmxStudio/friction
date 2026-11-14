@@ -18,3 +18,23 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m unittest test_friction
       - run: python installer.py --dry-run --no-services
+      - name: Real install with launchd services (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -eux
+          mkdir -p ~/.claude
+          python installer.py
+          for i in $(seq 1 15); do
+            curl -fsS http://127.0.0.1:8798/api/report >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8798/api/report | head -c 300
+          launchctl print "gui/$(id -u)/io.github.martinwheeler.friction.web" | grep -E 'state|program'
+          launchctl print "gui/$(id -u)/io.github.martinwheeler.friction.backfill" | grep -E 'state|Hour|Minute'
+          python installer.py | grep -c '^ok'
+          curl -fsS http://127.0.0.1:8798/ >/dev/null
+          python installer.py --uninstall
+          test ! -e ~/Library/LaunchAgents/io.github.martinwheeler.friction.web.plist
+          test ! -e ~/Library/LaunchAgents/io.github.martinwheeler.friction.backfill.plist
+          sleep 1
+          if curl -fsS http://127.0.0.1:8798/ >/dev/null 2>&1; then echo "web view still running after uninstall"; exit 1; fi

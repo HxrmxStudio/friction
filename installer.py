@@ -6,13 +6,15 @@
   python3 installer.py --uninstall     remove everything except the database
 
 It links the `friction` CLI and the agent skill, registers the hook with
-Claude Code and Codex where they are installed, and on systemd machines starts
-the web view and the nightly backfill timer. Existing settings files are
+Claude Code and Codex where they are installed, and starts the web view and the
+nightly backfill as background services (systemd user units on Linux, launchd
+LaunchAgents on macOS). Existing settings files are
 merged, never replaced, and a `.bak` copy is written before the first change.
 """
 import argparse
 import json
 import os
+import plistlib
 import shlex
 import shutil
 import sqlite3
@@ -28,6 +30,8 @@ CODEX_EVENTS = ('SessionStart', 'PreToolUse', 'PostToolUse', 'Stop')
 UNITS = ('friction-web.service', 'friction-backfill.service',
          'friction-backfill.timer')
 ENABLE = ('friction-web.service', 'friction-backfill.timer')
+LAUNCHD_WEB = 'io.github.martinwheeler.friction.web'
+LAUNCHD_BACKFILL = 'io.github.martinwheeler.friction.backfill'
 
 DRY = False
 
@@ -124,6 +128,16 @@ def skill_dirs():
 
 # ---- services ------------------------------------------------------------
 
+def backfill_path():
+    """PATH for the scheduled backfill, which needs to find the `claude` CLI."""
+    claude = shutil.which('claude')
+    return os.pathsep.join(dict.fromkeys(
+        ([str(Path(claude).parent)] if claude else [])
+        + [str(HOME / '.local/bin')]
+        + (['/opt/homebrew/bin'] if sys.platform == 'darwin' else [])
+        + ['/usr/local/bin', '/usr/bin', '/bin']))
+
+
 def unit_text(name, port):
     py, app = sys.executable, APP
     if name == 'friction-web.service':
@@ -131,12 +145,8 @@ def unit_text(name, port):
                 f'[Service]\nExecStart="{py}" "{app}/web.py" --port {port}\nRestart=on-failure\n\n'
                 '[Install]\nWantedBy=default.target\n')
     if name == 'friction-backfill.service':
-        claude = shutil.which('claude')
-        path = os.pathsep.join(dict.fromkeys(
-            ([str(Path(claude).parent)] if claude else [])
-            + [str(HOME / '.local/bin'), '/usr/local/bin', '/usr/bin', '/bin']))
         return ("[Unit]\nDescription=Friction: mine the day's transcripts for unlogged friction\n\n"
-                f'[Service]\nType=oneshot\nEnvironment=PATH={path}\n'
+                f'[Service]\nType=oneshot\nEnvironment=PATH={backfill_path()}\n'
                 f'ExecStart="{py}" "{app}/friction.py" backfill --since 2d\n')
     return ('[Unit]\nDescription=Nightly friction backfill\n\n'
             '[Timer]\nOnCalendar=*-*-* 03:30:00\nPersistent=true\n\n'
@@ -154,10 +164,74 @@ def have_systemd():
         subprocess.run(('systemctl', '--user', 'show-environment'), capture_output=True).returncode == 0
 
 
+def have_launchd():
+    return sys.platform == 'darwin' and bool(shutil.which('launchctl'))
+
+
+def agent_plists(port):
+    """label -> launchd job definition (macOS LaunchAgents)."""
+    py, logs = sys.executable, str(HOME / 'Library/Logs')
+    return {
+        LAUNCHD_WEB: {
+            'Label': LAUNCHD_WEB,
+            'ProgramArguments': [py, str(APP / 'web.py'), '--port', str(port)],
+            'RunAtLoad': True,
+            'KeepAlive': True,
+            'StandardErrorPath': logs + '/friction-web.log',
+        },
+        LAUNCHD_BACKFILL: {
+            'Label': LAUNCHD_BACKFILL,
+            'ProgramArguments': [py, str(APP / 'friction.py'), 'backfill', '--since', '2d'],
+            'StartCalendarInterval': {'Hour': 3, 'Minute': 30},
+            'EnvironmentVariables': {'PATH': backfill_path()},
+            'StandardOutPath': logs + '/friction-backfill.log',
+            'StandardErrorPath': logs + '/friction-backfill.log',
+        },
+    }
+
+
+def launchctl(*cmd):
+    if DRY:
+        return True
+    return subprocess.run(('launchctl',) + cmd, capture_output=True).returncode == 0
+
+
+def launchd_services(args):
+    domain = f'gui/{os.getuid()}'
+    for label, job in agent_plists(args.port).items():
+        dest = HOME / 'Library/LaunchAgents' / (label + '.plist')
+        data = plistlib.dumps(job)
+        if dest.exists() and dest.read_bytes() == data:
+            say(f'ok       {dest}')
+            launchctl('bootstrap', domain, str(dest))     # no-op if already loaded
+            continue
+        say(f'agent    {dest}')
+        if not DRY:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            (HOME / 'Library/Logs').mkdir(parents=True, exist_ok=True)
+            launchctl('bootout', f'{domain}/{label}')
+            dest.write_bytes(data)
+            if not launchctl('bootstrap', domain, str(dest)):
+                say(f'warning  could not load {label}; it will start at next login')
+    say(f'web view http://127.0.0.1:{args.port}')
+
+
+def remove_launchd():
+    for label in (LAUNCHD_WEB, LAUNCHD_BACKFILL):
+        dest = HOME / 'Library/LaunchAgents' / (label + '.plist')
+        if dest.exists():
+            say(f'remove   {dest}')
+            launchctl('bootout', f'gui/{os.getuid()}/{label}')
+            if not DRY:
+                dest.unlink()
+
+
 def services(args):
+    if have_launchd():
+        return launchd_services(args)
     if not have_systemd():
-        return say('services skipped (no systemd user session): run `friction web` for the web'
-                   ' view and schedule `friction backfill` yourself if you want it')
+        return say('services skipped (no systemd user session or launchd): run `friction web` for'
+                   ' the web view and schedule `friction backfill` yourself if you want it')
     unit_dir = HOME / '.config/systemd/user'
     changed = False
     for name in UNITS:
@@ -181,6 +255,8 @@ def services(args):
 
 
 def remove_services():
+    if have_launchd():
+        return remove_launchd()
     unit_dir = HOME / '.config/systemd/user'
     if have_systemd():
         for name in ENABLE:
@@ -214,7 +290,7 @@ def main():
     ap.add_argument('--no-hooks', action='store_true', help='do not touch agent hook settings')
     ap.add_argument('--no-claude', action='store_true', help='skip Claude Code')
     ap.add_argument('--no-codex', action='store_true', help='skip Codex')
-    ap.add_argument('--no-services', action='store_true', help='skip the systemd user units')
+    ap.add_argument('--no-services', action='store_true', help='skip the background services (systemd / launchd)')
     ap.add_argument('--port', type=int, default=8798, help='web view port (default 8798)')
     ap.add_argument('--bin-dir', default=str(HOME / '.local/bin'), help='where to link `friction`')
     args = ap.parse_args()

@@ -46,7 +46,8 @@ The installer is safe to re-run, and re-running it updates. It:
 2. links the `friction` command into `~/.local/bin`
 3. links the agent skill into `~/.agents/skills`, `~/.claude/skills` and `~/.codex/skills`
 4. adds the hook to `~/.claude/settings.json` and `~/.codex/hooks.json` (merged with what is there, with a `.bak` copy saved first)
-5. on systemd machines, starts the web view on <http://127.0.0.1:8798> and a nightly backfill timer
+5. starts the web view on <http://127.0.0.1:8798> and a nightly backfill, as background services
+   that come back at login: systemd user units on Linux, launchd LaunchAgents on macOS
 
 Steps for an agent you do not have installed are skipped.
 
@@ -64,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/martinwheeler/friction/main/install
 | `--dry-run` | print every change without making it |
 | `--no-hooks` | leave agent settings alone |
 | `--no-claude`, `--no-codex` | skip one agent |
-| `--no-services` | no systemd units |
+| `--no-services` | no background services (systemd units or LaunchAgents) |
 | `--port N` | web view port (default 8798) |
 | `--bin-dir DIR` | where to link `friction` (default `~/.local/bin`) |
 
