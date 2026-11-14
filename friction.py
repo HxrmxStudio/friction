@@ -15,6 +15,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from pathlib import Path
 
 DEFAULT_DIR = '~/.local/share/friction'
@@ -109,7 +110,23 @@ CREATE TABLE IF NOT EXISTS backfill_sessions (
   filed INTEGER,
   status TEXT
 );
+
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
+
+# Columns added after the first release, for syncing items to an external tracker (tracker.py).
+MIGRATIONS = [
+    'ALTER TABLE items ADD COLUMN remote_key TEXT',          # e.g. the Jira issue key
+    'ALTER TABLE items ADD COLUMN remote_url TEXT',
+    'ALTER TABLE items ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0',   # DIRTY_* bits not yet pushed
+    'ALTER TABLE occurrences ADD COLUMN uid TEXT',           # identity shared across machines
+    'ALTER TABLE occurrences ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0',
+    'CREATE INDEX IF NOT EXISTS occ_uid ON occurrences(uid)',
+    'CREATE INDEX IF NOT EXISTS items_remote ON items(remote_key)',
+]
+DIRTY_STATS = 1      # hit count or time wasted changed
+DIRTY_CONTENT = 2    # title, detail, workaround or fix note changed
+DIRTY_STATUS = 4     # opened, resolved, wontfix or merged
 
 SECRET_PATTERNS = [
     (re.compile(r'\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
@@ -202,6 +219,28 @@ class Friction:
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=NORMAL')
         self.db.executescript(SCHEMA)
+        version = self.db.execute('PRAGMA user_version').fetchone()[0]
+        if version < len(MIGRATIONS):
+            for sql in MIGRATIONS[version:]:
+                try:
+                    self.db.execute(sql)
+                except sqlite3.OperationalError:      # another process got there first
+                    pass
+            self.db.execute(f'PRAGMA user_version={len(MIGRATIONS)}')
+            self.db.commit()
+
+    def meta(self, key, default=None):
+        row = self.db.execute('SELECT v FROM meta WHERE k=?', (key,)).fetchone()
+        return row['v'] if row else default
+
+    def set_meta(self, key, value):
+        self.db.execute('INSERT INTO meta(k, v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',
+                        (key, None if value is None else str(value)))
+        self.db.commit()
+
+    def mark_dirty(self, item_id, bits):
+        """Flag an item as changed since it was last pushed to the tracker."""
+        self.db.execute('UPDATE items SET dirty = dirty | ? WHERE id=?', (bits, item_id))
 
     # ---- sessions and events (written by hooks and backfill) -------------
 
@@ -443,16 +482,19 @@ class Friction:
         regression = 1 if item['status'] == 'resolved' and ts >= (item['resolved_at'] or 0) else 0
         cur = self.db.execute(
             'INSERT INTO occurrences(item_id, ts, session_id, agent, project, wasted_s, timing,'
-            ' from_event, to_event, tool_calls, failed_calls, note, source, regression)'
-            ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ' from_event, to_event, tool_calls, failed_calls, note, source, regression, uid)'
+            ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (item_id, ts, session_id, agent, project, wasted, timing,
              win and win['from_event'], win and win['to_event'], win and win['tool_calls'],
-             win and win['failed_calls'], redact(note, 1000) or '', source, regression))
+             win and win['failed_calls'], redact(note, 1000) or '', source, regression,
+             uuid.uuid4().hex[:16]))
         if regression:
             self.db.execute("UPDATE items SET status='open', regressions=regressions+1,"
                             ' resolved_at=NULL, updated=? WHERE id=?', (now, item_id))
+            self.mark_dirty(item_id, DIRTY_STATS | DIRTY_STATUS)
         else:
             self.db.execute('UPDATE items SET updated=? WHERE id=?', (now, item_id))
+            self.mark_dirty(item_id, DIRTY_STATS)
         if session_id and source == 'live':
             self.set_mark(session_id)
         self.db.commit()
@@ -467,6 +509,7 @@ class Friction:
             text = item['workaround'] + '\n' + text
         self.db.execute('UPDATE items SET workaround=?, updated=? WHERE id=?',
                         (text, now or time.time(), item['id']))
+        self.mark_dirty(item['id'], DIRTY_CONTENT)
         self._index(item['id'])
         self.db.commit()
         return item['id']
@@ -480,6 +523,7 @@ class Friction:
         else:
             self.db.execute('UPDATE items SET status=?, fix_note=?, resolved_at=?, updated=? WHERE id=?',
                             (status, redact(note, 2000) or item['fix_note'], now, now, item['id']))
+        self.mark_dirty(item['id'], DIRTY_STATUS | DIRTY_CONTENT)
         self.db.commit()
         return item['id']
 
@@ -503,6 +547,8 @@ class Friction:
             (aliases, detail, workaround, status, src['regressions'], src['created'], now, dst['id']))
         self.db.execute("UPDATE items SET status='merged', merged_into=?, updated=? WHERE id=?",
                         (dst['id'], now, src['id']))
+        self.mark_dirty(src['id'], DIRTY_STATUS)
+        self.mark_dirty(dst['id'], DIRTY_STATS | DIRTY_CONTENT | DIRTY_STATUS)
         self._index(src['id'])
         self._index(dst['id'])
         self.db.commit()
@@ -532,6 +578,7 @@ class Friction:
         cond = ' AND '.join(where)
         rows = self.db.execute(
             'SELECT i.id, i.title, i.status, i.workaround, i.fix_note, i.regressions,'
+            ' i.remote_key, i.remote_url,'
             ' COUNT(o.id) n, COUNT(DISTINCT o.session_id) sessions,'
             ' COALESCE(SUM(o.wasted_s), 0) wasted, AVG(o.wasted_s) avg_wasted,'
             " COALESCE(SUM(o.timing='estimate'), 0) estimated,"
@@ -688,6 +735,8 @@ def cmd_show(fr, args):
     item = fr.item(args.id)
     st = fr.stats(item['id'])
     print(f"#{item['id']} [{item['status']}] {item['title']}")
+    if item['remote_key']:
+        print(f"  tracker:    {item['remote_key']}  {item['remote_url'] or ''}")
     if item['detail']:
         print(f"  detail:     {item['detail']}")
     if item['aliases']:
@@ -824,6 +873,25 @@ def cmd_backfill(fr, args):
     return backfill.run(fr, args)
 
 
+def cmd_sync(fr, args):
+    import tracker
+    return tracker.run(fr, args)
+
+
+def kick_sync():
+    """Start a detached `friction sync` if a tracker is configured. Never blocks or raises."""
+    try:
+        import subprocess
+        import tracker
+        if not tracker.config_path().exists():
+            return
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'sync', '--quiet'],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
 def cmd_web(fr, args):
     import web
     print(f'friction web view: http://{args.host}:{args.port}  (ctrl-c to stop)')
@@ -925,6 +993,12 @@ def build_parser():
     p.add_argument('--redo', action='store_true', help='re-analyse sessions already processed')
     p.set_defaults(fn=cmd_backfill)
 
+    p = sub.add_parser('sync', help='sync items with the configured tracker (e.g. Jira)')
+    p.add_argument('--check', action='store_true', help='test the connection and show what is pending')
+    p.add_argument('--dry-run', action='store_true', help='show what would be pushed, change nothing')
+    p.add_argument('--quiet', action='store_true', help='no output unless something fails')
+    p.set_defaults(fn=cmd_sync)
+
     p = sub.add_parser('web', help='serve the read-only web heatmap')
     p.add_argument('--port', type=int, default=8798)
     p.add_argument('--host', default='127.0.0.1')
@@ -932,11 +1006,17 @@ def build_parser():
     return ap
 
 
+SYNC_AFTER = {'log', 'bump', 'workaround', 'resolve', 'wontfix', 'reopen', 'merge', 'backfill'}
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         fr = Friction()
-        return args.fn(fr, args)
+        code = args.fn(fr, args)
+        if args.cmd in SYNC_AFTER:
+            kick_sync()
+        return code
     except (KeyError, ValueError) as exc:
         print(f'friction: {exc.args[0] if exc.args else exc}', file=sys.stderr)
         return 1

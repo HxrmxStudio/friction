@@ -141,7 +141,9 @@ function render(rep) {
     const badges = (it.estimated ? `<span class="badge est" title="Wasted time for these occurrences is the agent's estimate, not measured from tool events">~ ${it.estimated} estimated</span>` : '')
       + (it.untimed ? `<span class="badge">${it.untimed} untimed</span>` : '')
       + (it.regressed ? `<span class="badge reg">↺ regressed</span>` : '')
-      + (it.status !== 'open' ? `<span class="badge">${esc(it.status)}</span>` : '');
+      + (it.status !== 'open' ? `<span class="badge">${esc(it.status)}</span>` : '')
+      + (it.remote_key && /^https?:\/\//.test(it.remote_url || '')
+          ? `<a class="badge" href="${esc(it.remote_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Open in the tracker">${esc(it.remote_key)} ↗</a>` : '');
     html += `<tr class="item" data-id="${it.id}"><td class="title">#${it.id} ${esc(it.title)}${badges}</td>
       <td class="num">${it.n}</td><td class="num">${dur(it.wasted)}</td><td class="num">${dur(it.avg_wasted)}</td>
       <td><div class="heat">${cells}</div></td></tr>

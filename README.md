@@ -10,7 +10,7 @@
 ![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 ![works with Claude Code and Codex](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex-d97757.svg)
 
-[Install](#install) · [How it works](#how-it-works) · [Commands](#commands) · [Privacy](#privacy) · [Uninstall](#uninstall)
+[Install](#install) · [How it works](#how-it-works) · [Commands](#commands) · [Jira sync](#sync-with-jira) · [Privacy](#privacy) · [Uninstall](#uninstall)
 
 <img src="docs/web.png" alt="The friction web view: a heatmap of friction items by day, with time wasted per item, project and agent" width="860">
 
@@ -30,6 +30,8 @@ worst offenders and their workarounds. You get a heatmap of where the time goes.
 - **Shared across agents.** Claude Code and Codex write to one database on your machine.
 - **Self-healing.** A workaround logged once is handed to every later session.
 - **Nothing to run.** Python standard library and one SQLite file. No server, no account, no network.
+- **Or share it with the team.** Optionally keep the items in [Jira](#sync-with-jira), so everyone's
+  agents see the same list.
 
 ## Install
 
@@ -143,6 +145,7 @@ Agents run these themselves, guided by the bundled skill. They work just as well
 | `friction report [--week\|--month] [--project P] [--agent A] [--json]` | heatmap |
 | `friction backfill --since 30d [--dry-run]` | mine past transcripts |
 | `friction web [--port N]` | serve the web view |
+| `friction sync [--check\|--dry-run]` | sync items with Jira, if configured |
 
 ### Where the time comes from
 
@@ -160,16 +163,82 @@ Every occurrence records how its wasted time was obtained, and reports keep the 
 `open` → `resolved` or `wontfix`. Resolved items leave the hot list. A new hit on a resolved item
 reopens it and counts as a regression.
 
+## Sync with Jira
+
+By default every item stays in the local database. Point friction at a Jira Cloud project and
+the items live there instead, shared with your team, while the local database keeps doing the
+fast work (timing, duplicate search, the heatmap).
+
+> Jira sync is new. It has been run end to end against one Jira Cloud site with the default
+> workflow, and CI tests it against a fake Jira. Custom workflows and required fields may need
+> changes; please open an issue if yours does.
+
+```ini
+# ~/.config/friction/config.ini
+[tracker]
+type = jira
+url = https://yoursite.atlassian.net
+email = you@example.com
+project = FRIC
+token_file = ~/.config/friction/jira-token
+```
+
+Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>, put it in
+that file as the only line, and `chmod 600` it. Then:
+
+```sh
+friction sync --check     # test the connection, show what is waiting
+friction sync             # pull, then push
+```
+
+| In friction | In Jira |
+|---|---|
+| a new item | an issue labelled `friction`, with detail, workaround and fix as sections |
+| each occurrence (`log`, `bump`) | a comment: who hit it, where, how much time it cost |
+| hit count and time wasted | a totals line at the foot of the description |
+| `resolve`, `wontfix`, a regression | the issue moves to a done status, or back out of one |
+
+It works in both directions. An issue a teammate's agent logged, a workaround someone edited in
+Jira, or an issue a person closed all arrive on the next sync, and show up in every agent's hot
+list and duplicate search.
+
+- **Agents never wait on Jira.** Commands write locally and start a sync in the background. A
+  new session also starts one if the last was more than ten minutes ago.
+- **Offline is fine.** Unpushed changes stay flagged and go out on the next sync.
+- **If both sides change the same item**, your local edit wins for the fields you edited.
+- **Only items and occurrences are sent**: titles, details, workarounds, notes, project names,
+  agent names and timings. Raw tool-call events never leave your machine.
+
+<details>
+<summary>More tracker options</summary>
+
+| Key | Default | Use |
+|---|---|---|
+| `token_file` | | file holding the API token |
+| `token_env` | `FRICTION_JIRA_TOKEN` | environment variable holding the token (checked first) |
+| `token_cmd` | | command that prints the token, e.g. a password manager |
+| `issue_type` | `Task` | issue type to create |
+| `label` | `friction` | label that marks issues as friction items |
+| `cloud_id` | | required for scoped API tokens; routes calls through `api.atlassian.com` |
+
+`FRICTION_CONFIG` overrides the config file path. To stop syncing, delete the file or set
+`type = none`; items already in Jira stay there.
+
+</details>
+
 ## Privacy
 
-Everything stays on your machine, in `~/.local/share/friction/friction.db`.
+Unless you configure a tracker, everything stays on your machine, in
+`~/.local/share/friction/friction.db`.
 
 - Tool input and error text are cut to 500 characters and scrubbed of obvious secrets (tokens,
   keys, passwords in URLs) before they are stored. Treat this as a safety net, not a guarantee.
 - Raw tool events are deleted after 30 days. Items and occurrences are kept.
 - The web view is read-only and listens on `127.0.0.1` only.
-- `friction backfill` sends transcript excerpts to the model through your own `claude` CLI. Nothing
-  else makes a network request. Do not enable the timer if you do not want that.
+- `friction backfill` sends transcript excerpts to the model through your own `claude` CLI. Do not
+  enable the timer if you do not want that.
+- [Jira sync](#sync-with-jira), if you configure it, sends items and occurrences to your Jira site.
+- Nothing else makes a network request.
 
 ## Configuration
 
@@ -198,11 +267,12 @@ This removes the links, the hook entries and the services. Your database is left
 | `friction_hook.py` | Claude Code and Codex hook |
 | `backfill.py` | transcript mining |
 | `web.py`, `web.html` | read-only web view |
+| `tracker.py` | optional sync with an issue tracker (Jira Cloud) |
 | `SKILL.md` | instructions agents load |
 | `installer.py`, `install.sh` | install, update, uninstall |
 
 ```sh
-python3 -m unittest test_friction
+python3 -m unittest test_friction test_tracker
 ```
 
 Issues and pull requests are welcome. Support for other agents needs only a hook that sends the

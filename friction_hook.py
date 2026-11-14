@@ -19,12 +19,14 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from friction import Friction, fmt_duration  # noqa: E402
+from friction import Friction, fmt_duration, kick_sync  # noqa: E402
 
 NUDGE_MIN_FAILURES = 2
+SYNC_EVERY_S = 600
 INPUT_KEYS = ('command', 'file_path', 'path', 'pattern', 'url', 'query', 'skill', 'description',
               'prompt', 'subagent_type', 'cmd')
 FAIL_TEXT = re.compile(r'(?i)^\s*(error\b|exit code [1-9]|command failed|permission denied'
@@ -128,6 +130,11 @@ def handle(event, fr, agent):
         if event.get('source') in (None, 'startup', 'clear', 'resume', 'compact'):
             out = {'hookSpecificOutput': {'hookEventName': 'SessionStart',
                                           'additionalContext': start_context(fr)}}
+            # Pick up what teammates logged in the tracker, at most every few minutes, in the
+            # background: this session starts with the cached list, the next one has the news.
+            if time.time() - float(fr.meta('sync_kick') or 0) > SYNC_EVERY_S:
+                fr.set_meta('sync_kick', time.time())
+                kick_sync()
     elif name == 'PreToolUse':
         sess = fr.session(session)
         fr.add_event(session, 'tool', tool=event.get('tool_name'),
