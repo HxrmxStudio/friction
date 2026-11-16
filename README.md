@@ -10,7 +10,7 @@
 ![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 ![works with Claude Code and Codex](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex-d97757.svg)
 
-[Install](#install) · [How it works](#how-it-works) · [Commands](#commands) · [Jira sync](#sync-with-jira) · [Privacy](#privacy) · [Uninstall](#uninstall)
+[Install](#install) · [How it works](#how-it-works) · [Docs](https://martinwheeler.github.io/friction-docs/) · [Commands](#commands) · [Jira sync](#sync-with-jira) · [Privacy](#privacy) · [Uninstall](#uninstall)
 
 <img src="docs/web.png" alt="The friction web view: a heatmap of friction items by day, with time wasted per item, project and agent" width="860">
 
@@ -110,6 +110,9 @@ friction web          # web view, if the service is not running
 4. **Backfill catches the rest.** `friction backfill` reads past transcripts, skips the quiet ones,
    and has a headless `claude -p` on a small model classify the rest. This is the only part that
    uses the `claude` CLI, and it is optional.
+
+For the details (how time is measured, the hot list ranking, backfill, sync, the schema) and
+diagrams of each part, see [How friction works](https://martinwheeler.github.io/friction-docs/).
 
 A terminal report looks like this:
 
