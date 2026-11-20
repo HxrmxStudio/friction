@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -290,6 +291,28 @@ class Backfill(Base):
         waits = [(e['tool'], e['duration_ms']) for e in events if e.get('kind') == 'wait']
         self.assertEqual(waits, [('prompt', 220000)])
         self.assertEqual([e.get('kind', 'tool') for e in events], ['tool', 'wait'])
+
+    def test_retime_takes_transcript_waits_out(self):
+        self.call('r', False, 0, dur=2)
+        self.call('r', False, 200, dur=2)
+        item = self.fr.create('x')
+        res = self.fr.occur(item, session_id='r', now=self.t + 210)
+        self.assertEqual(round(res['wasted_s']), 210)            # logged before waits existed
+        path = Path(self.tmp.name) / 'r.jsonl'
+        iso = lambda sec: datetime.fromtimestamp(self.t + sec, timezone.utc).isoformat()
+        lines = [{'type': 'assistant', 'sessionId': 'r', 'timestamp': iso(10),
+                  'message': {'content': [{'type': 'text', 'text': 'need your help'}]}},
+                 {'type': 'user', 'sessionId': 'r', 'timestamp': iso(195),
+                  'message': {'content': 'here you go'}}]
+        path.write_text('\n'.join(json.dumps(x) for x in lines))
+        self.fr.touch_session('r', 'claude', '/home/x/code/proj', str(path))
+        self.fr.db.commit()
+        args = type('A', (), {'dry_run': True})
+        backfill.retime(self.fr, args)
+        self.assertEqual(round(self.fr.occurrences(item)[0]['wasted_s']), 210)   # dry run: untouched
+        args.dry_run = False
+        backfill.retime(self.fr, args)
+        self.assertEqual(round(self.fr.occurrences(item)[0]['wasted_s']), 25)
 
     def test_parse_codex_turn_waits(self):
         path = Path(self.tmp.name) / 'rollout.jsonl'

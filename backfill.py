@@ -218,6 +218,62 @@ def import_events(fr, session, agent, cwd, path, events):
     return len(fresh)
 
 
+def import_waits(fr, session, path, agent):
+    """Add the transcript's waits on the user that no recorded wait already covers. -> count"""
+    try:
+        _, _, events = (parse_claude if agent == 'claude' else parse_codex)(path)
+    except OSError:
+        return 0
+    n = 0
+    for ev in events:
+        if ev.get('kind') != 'wait':
+            continue
+        end = ev['ts'] + ev['duration_ms'] / 1000
+        if fr.db.execute("SELECT 1 FROM events WHERE session_id=? AND kind='wait' AND ts<?"
+                         ' AND ts + COALESCE(duration_ms, 0) / 1000.0 > ? LIMIT 1',
+                         (session, end, ev['ts'])).fetchone():
+            continue
+        fr.add_wait(session, ev['tool'], ev['ts'], end, source='transcript')
+        n += 1
+    return n
+
+
+def retime(fr, args):
+    """Re-measure event-timed occurrences with waits on the user taken out."""
+    occs = fr.db.execute(
+        "SELECT o.*, s.transcript, s.agent sagent, i.title FROM occurrences o"
+        " JOIN items i ON i.id = o.item_id LEFT JOIN sessions s ON s.session_id = o.session_id"
+        " WHERE o.timing IN ('hook', 'transcript') AND o.from_event IS NOT NULL ORDER BY o.ts").fetchall()
+    seen, waits, changed, skipped, before, after = set(), 0, 0, 0, 0.0, 0.0
+    for occ in occs:
+        session = occ['session_id']
+        if session not in seen:
+            seen.add(session)
+            path = occ['transcript']
+            if path and Path(path).exists():
+                waits += import_waits(fr, session, path, occ['sagent'] or occ['agent'] or 'claude')
+        new = fr.retime(occ)
+        if new is None:
+            skipped += 1
+            continue
+        old = occ['wasted_s'] or 0
+        before, after = before + old, after + new
+        if abs(new - old) >= 1:
+            changed += 1
+            print(f"  occ {occ['id']:>4} #{occ['item_id']:<4} {fmt_duration(old):>8} -> {fmt_duration(new):>8}"
+                  f"  {occ['title'][:60]}")
+            if not args.dry_run:
+                fr.set_wasted(occ['id'], new)
+    if args.dry_run:
+        fr.db.rollback()
+    else:
+        fr.db.commit()
+    print(f"{'Would change' if args.dry_run else 'Changed'} {changed} of {len(occs)} occurrences"
+          f" ({fmt_duration(before)} -> {fmt_duration(after)} wasted); {waits} waits read from"
+          f" {len(seen)} session transcripts; {skipped} skipped (events past retention).")
+    return 0
+
+
 def excerpt(fr, session):
     """Unlogged failures with a little context either side, as text. -> (text, valid ids)"""
     sess = fr.session(session)

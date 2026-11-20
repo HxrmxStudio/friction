@@ -148,6 +148,7 @@ Agents run these themselves, guided by the bundled skill. They work just as well
 | `friction report [--week\|--month] [--project P] [--agent A] [--json]` | heatmap |
 | `friction backfill --since 30d [--dry-run]` | mine past transcripts |
 | `friction web [--port N]` | serve the web view |
+| `friction retime [--dry-run]` | re-measure logged occurrences without time spent waiting on you |
 | `friction sync [--enable\|--disable\|--check\|--dry-run]` | sync items with Jira (off by default) |
 
 ### Where the time comes from
@@ -163,7 +164,9 @@ Every occurrence records how its wasted time was obtained, and reports keep the 
 
 Measured time leaves out idle gaps (over 5 minutes beyond a call's own run) and any time spent
 waiting on you: from the end of a turn to your next prompt, permission prompts, and questions such
-as `AskUserQuestion`. Pending user input is not friction.
+as `AskUserQuestion`. Pending user input is not friction. `friction retime` re-measures
+occurrences logged before this, reading the waits from their session transcripts
+(`--dry-run` to preview).
 
 ### Lifecycle
 

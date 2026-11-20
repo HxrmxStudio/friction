@@ -452,7 +452,7 @@ class Friction:
         """
         rows = self.db.execute(
             "SELECT ts, duration_ms FROM events WHERE session_id=? AND kind='tool' AND id>=? AND id<=?"
-            ' ORDER BY ts', (session_id, first_id, last_id)).fetchall()
+            ' AND ts<=? ORDER BY ts', (session_id, first_id, last_id, end_ts)).fetchall()
         if not rows:
             return 0.0
         spans = []
@@ -677,6 +677,22 @@ class Friction:
         }
         return {'days': days, 'since': since, 'now': now, 'day_list': day_list, 'total': total,
                 'items': items, 'projects': facets['project'], 'agents': facets['agent']}
+
+    def retime(self, occ):
+        """Measure an event-timed occurrence again over its original window. -> seconds or None."""
+        if occ['timing'] not in (TIMING_HOOK, TIMING_TRANSCRIPT) or not occ['from_event']:
+            return None
+        if not self.db.execute('SELECT 1 FROM events WHERE id=? AND session_id=?',
+                               (occ['from_event'], occ['session_id'])).fetchone():
+            return None       # the raw events are past retention
+        # Live logs ran to the log call itself; backfilled ones to an explicit to_event.
+        hi = occ['to_event'] if occ['source'] == 'backfill' and occ['to_event'] else 1 << 62
+        return self.active_seconds(occ['session_id'], occ['from_event'], hi, occ['ts'])
+
+    def set_wasted(self, occ_id, wasted_s):
+        row = self.db.execute('SELECT item_id FROM occurrences WHERE id=?', (occ_id,)).fetchone()
+        self.db.execute('UPDATE occurrences SET wasted_s=? WHERE id=?', (wasted_s, occ_id))
+        self.mark_dirty(row['item_id'], DIRTY_STATS)
 
     def occurrences(self, item_id, limit=50):
         return self.db.execute('SELECT * FROM occurrences WHERE item_id=? ORDER BY ts DESC LIMIT ?',
@@ -934,6 +950,11 @@ def cmd_backfill(fr, args):
     return backfill.run(fr, args)
 
 
+def cmd_retime(fr, args):
+    import backfill
+    return backfill.retime(fr, args)
+
+
 def cmd_sync(fr, args):
     import tracker
     return tracker.run(fr, args)
@@ -1054,6 +1075,11 @@ def build_parser():
     p.add_argument('--redo', action='store_true', help='re-analyse sessions already processed')
     p.set_defaults(fn=cmd_backfill)
 
+    p = sub.add_parser('retime', help='re-measure logged occurrences, taking out time spent'
+                       ' waiting on the user (read from the session transcripts)')
+    p.add_argument('--dry-run', action='store_true', help='show the changes, write nothing')
+    p.set_defaults(fn=cmd_retime)
+
     p = sub.add_parser('sync', help='sync items with an issue tracker such as Jira (off by default)')
     p.add_argument('--enable', action='store_true',
                    help='turn tracker sync on (writes a config template the first time)')
@@ -1070,7 +1096,8 @@ def build_parser():
     return ap
 
 
-SYNC_AFTER = {'log', 'bump', 'workaround', 'resolve', 'wontfix', 'reopen', 'merge', 'backfill'}
+SYNC_AFTER = {'log', 'bump', 'workaround', 'resolve', 'wontfix', 'reopen', 'merge', 'backfill',
+              'retime'}
 
 
 def main(argv=None):
