@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Claude Code / Codex hook for friction.
 
-Registered for SessionStart, PreToolUse, PostToolUse, PostToolUseFailure and
-Stop (Claude: ~/.claude/settings.json, Codex: ~/.codex/hooks.json; pass
-`--agent codex` there).
+Registered for SessionStart, UserPromptSubmit, PreToolUse, PermissionRequest,
+PostToolUse, PostToolUseFailure and Stop (Claude: ~/.claude/settings.json,
+Codex: ~/.codex/hooks.json minus PostToolUseFailure; pass `--agent codex` there).
 
   PreToolUse          opens a timed event for the tool call
   PostToolUse[Failure] closes it with success/failure, duration and error text
   SessionStart        tells the agent the tool exists and lists hot items
   Stop                once per failure streak, asks the agent whether the
-                      failures it just had are worth logging
+                      failures it just had are worth logging; otherwise the
+                      turn is over and a wait on the user starts
+  UserPromptSubmit    ends that wait
+  PermissionRequest   starts a wait on a permission prompt, ended by the
+                      call finishing (or the next prompt or call)
+
+Waits are subtracted from measured wasted time: pending user input is not
+friction. So is the whole run of a question tool such as AskUserQuestion.
 
 Tool input and errors are truncated and scrubbed of obvious secrets before
 they are stored. Any error exits 0 silently: this must never break an agent.
@@ -23,7 +30,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from friction import Friction, fmt_duration, kick_sync  # noqa: E402
+from friction import USER_INPUT_TOOLS, Friction, fmt_duration, kick_sync  # noqa: E402
 
 NUDGE_MIN_FAILURES = 2
 SYNC_EVERY_S = 600
@@ -135,7 +142,12 @@ def handle(event, fr, agent):
             if time.time() - float(fr.meta('sync_kick') or 0) > SYNC_EVERY_S:
                 fr.set_meta('sync_kick', time.time())
                 kick_sync()
+    elif name == 'UserPromptSubmit':
+        fr.close_waits(session)
+    elif name == 'PermissionRequest':
+        fr.open_wait(session, 'permission')
     elif name == 'PreToolUse':
+        fr.close_waits(session)       # a denied permission prompt never sees a PostToolUse
         sess = fr.session(session)
         fr.add_event(session, 'tool', tool=event.get('tool_name'),
                      tool_use_id=event.get('tool_use_id'),
@@ -143,8 +155,12 @@ def handle(event, fr, agent):
                      agent=agent, project=sess['project'] if sess else None)
     elif name in ('PostToolUse', 'PostToolUseFailure'):
         bad, error = failed(event)
+        fr.close_waits(session, ('permission',))
         done = fr.finish_event(session, event.get('tool_name'), event.get('tool_use_id'),
                                ok=not bad, error=error, duration_ms=event.get('duration_ms'))
+        if done is not None and event.get('tool_name') in USER_INPUT_TOOLS:
+            start = fr.db.execute('SELECT ts FROM events WHERE id=?', (done,)).fetchone()['ts']
+            fr.add_wait(session, event.get('tool_name'), start, time.time())
         if done is None:      # no PreToolUse seen (hook added mid-session): record it untimed
             sess = fr.session(session)
             fr.add_event(session, 'tool', tool=event.get('tool_name'),
@@ -152,11 +168,14 @@ def handle(event, fr, agent):
                          duration_ms=event.get('duration_ms'), error=error,
                          summary=summarize(event.get('tool_name'), event.get('tool_input')),
                          agent=agent, project=sess['project'] if sess else None)
-    elif name == 'Stop' and not event.get('stop_hook_active'):
-        fails = fr.unnudged_failures(session)
+    elif name == 'Stop':
+        fails = [] if event.get('stop_hook_active') else fr.unnudged_failures(session)
         if len(fails) >= NUDGE_MIN_FAILURES:
             fr.set_nudged(session)
             out = {'decision': 'block', 'reason': nudge_text(fails)}
+        else:                         # the turn is over: from here on it is the user's time
+            fr.close_waits(session)
+            fr.open_wait(session, 'prompt')
     fr.db.commit()
     return out
 

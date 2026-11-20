@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import backfill
 import friction
@@ -93,6 +94,20 @@ class Items(Base):
         slow = self.call('t', False, 0, dur=900)       # one long hanging call does count
         res = self.fr.occur(item, session_id='t', from_event=slow, now=self.t + 905)
         self.assertEqual(round(res['wasted_s']), 905)
+
+    def test_waiting_on_the_user_is_not_wasted_time(self):
+        first = self.call('s', False, 0, dur=2)
+        self.fr.add_wait('s', 'prompt', self.t + 10, self.t + 200)   # under IDLE_GAP_S, still not counted
+        self.call('s', False, 200, dur=2)
+        item = self.fr.create('x')
+        res = self.fr.occur(item, session_id='s', from_event=first, now=self.t + 210)
+        self.assertEqual(round(res['wasted_s']), 20)
+        # a wait whose closing hook never fired runs until the next tool call
+        first = self.call('t', False, 0, dur=2)
+        self.fr.open_wait('t', 'prompt', ts=self.t + 10)
+        self.call('t', False, 200, dur=2)
+        res = self.fr.occur(item, session_id='t', from_event=first, now=self.t + 210)
+        self.assertEqual(round(res['wasted_s']), 20)
 
     def test_explicit_from_event(self):
         first = self.call('s', True, 0)
@@ -189,6 +204,27 @@ class Hook(Base):
         self.call('s', True, 20)
         self.assertIsNone(self.ev('Stop'))
 
+    def test_user_waits_are_recorded_and_subtracted(self):
+        clock = [self.t]
+        def at(sec, name, **kw):
+            clock[0] = self.t + sec
+            return self.ev(name, **kw)
+        with mock.patch('time.time', lambda: clock[0]):
+            at(0, 'PreToolUse', tool_name='Bash', tool_use_id='a', tool_input={'command': 'x'})
+            at(1, 'PostToolUseFailure', tool_name='Bash', tool_use_id='a', error='boom')
+            at(5, 'Stop')                                   # turn over: the user's time from here
+            at(120, 'UserPromptSubmit', prompt='try again')
+            at(125, 'PreToolUse', tool_name='Bash', tool_use_id='b', tool_input={'command': 'x'})
+            at(126, 'PermissionRequest', tool_name='Bash', tool_input={'command': 'x'})
+            at(186, 'PostToolUseFailure', tool_name='Bash', tool_use_id='b', error='boom')
+            at(188, 'PreToolUse', tool_name='AskUserQuestion', tool_use_id='c', tool_input={})
+            at(288, 'PostToolUse', tool_name='AskUserQuestion', tool_use_id='c', tool_response={})
+            res = self.fr.occur(self.fr.create('x'), session_id='s', now=self.t + 290)
+        waits = [(r['tool'], r['duration_ms']) for r in self.fr.timeline('s') if r['kind'] == 'wait']
+        self.assertEqual(waits, [('prompt', 115000), ('permission', 60000), ('AskUserQuestion', 100000)])
+        self.assertEqual(res['timing'], 'hook')
+        self.assertEqual(round(res['wasted_s']), 15)       # 290s wall clock, 275s of it the user's
+
     def test_session_start_lists_hot_items(self):
         item = self.fr.create('gh auth expired', workaround='gh auth refresh')
         self.fr.occur(item, estimate_s=60)
@@ -231,6 +267,46 @@ class Backfill(Base):
         self.assertEqual(n, 1)
         occ = self.fr.occurrences(existing)[0]
         self.assertEqual((occ['timing'], occ['source'], round(occ['wasted_s'])), ('transcript', 'backfill', 70))
+
+    def test_parse_claude_prompt_waits(self):
+        path = Path(self.tmp.name) / 'w.jsonl'
+        lines = [
+            {'type': 'user', 'sessionId': 'w1', 'timestamp': '2026-11-01T00:00:00Z',
+             'message': {'content': 'start'}},
+            {'type': 'assistant', 'sessionId': 'w1', 'timestamp': '2026-11-01T00:00:10Z',
+             'message': {'content': [{'type': 'tool_use', 'id': 'u1', 'name': 'Bash', 'input': {}}]}},
+            {'type': 'user', 'sessionId': 'w1', 'timestamp': '2026-11-01T00:00:12Z',
+             'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'u1', 'is_error': True,
+                                      'content': 'nope'}]}},
+            {'type': 'assistant', 'sessionId': 'w1', 'timestamp': '2026-11-01T00:00:20Z',
+             'message': {'content': [{'type': 'text', 'text': 'stuck, what now?'}]}},
+            {'type': 'user', 'sessionId': 'w1', 'timestamp': '2026-11-01T00:04:00Z',
+             'message': {'content': [{'type': 'text', 'text': 'use the other token'}]}},
+            {'type': 'user', 'sessionId': 'w1', 'timestamp': '2026-11-01T00:04:01Z', 'isMeta': True,
+             'message': {'content': 'meta'}},
+        ]
+        path.write_text('\n'.join(json.dumps(x) for x in lines))
+        _, _, events = backfill.parse_claude(path)
+        waits = [(e['tool'], e['duration_ms']) for e in events if e.get('kind') == 'wait']
+        self.assertEqual(waits, [('prompt', 220000)])
+        self.assertEqual([e.get('kind', 'tool') for e in events], ['tool', 'wait'])
+
+    def test_parse_codex_turn_waits(self):
+        path = Path(self.tmp.name) / 'rollout.jsonl'
+        lines = [
+            {'type': 'session_meta', 'payload': {'id': 'c1', 'cwd': '/home/x/code/proj'}},
+            {'type': 'response_item', 'timestamp': '2026-11-01T00:00:00Z',
+             'payload': {'type': 'function_call', 'name': 'shell', 'call_id': 'k1', 'arguments': '{}'}},
+            {'type': 'response_item', 'timestamp': '2026-11-01T00:00:03Z',
+             'payload': {'type': 'function_call_output', 'call_id': 'k1', 'output': 'ok'}},
+            {'type': 'event_msg', 'timestamp': '2026-11-01T00:00:05Z', 'payload': {'type': 'task_complete'}},
+            {'type': 'event_msg', 'timestamp': '2026-11-01T00:03:05Z', 'payload': {'type': 'task_started'}},
+        ]
+        path.write_text('\n'.join(json.dumps(x) for x in lines))
+        session, _, events = backfill.parse_codex(path)
+        self.assertEqual(session, 'c1')
+        self.assertEqual([(e.get('kind', 'tool'), e['duration_ms']) for e in events],
+                         [('tool', 3000), ('wait', 180000)])
 
 
 if __name__ == '__main__':

@@ -24,6 +24,8 @@ EVENT_RETENTION_DAYS = 30
 STREAK_GAP_S = 600          # failures further apart than this are separate streaks
 IDLE_GAP_S = 300            # a longer pause between calls is idle time, not wasted time
 SELF_LOOKUP_S = 120         # how far back to look for our own in-flight Bash call
+# Tools whose whole run is the agent waiting on the user, not working.
+USER_INPUT_TOOLS = frozenset({'AskUserQuestion', 'ExitPlanMode', 'request_user_input'})
 
 # How an occurrence's wasted time was obtained.
 TIMING_HOOK = 'hook'              # measured from hook-recorded tool events
@@ -38,7 +40,7 @@ CREATE TABLE IF NOT EXISTS events (
   session_id TEXT NOT NULL,
   agent TEXT,
   project TEXT,
-  kind TEXT NOT NULL,            -- tool | prompt
+  kind TEXT NOT NULL,            -- tool | wait (pending user input: tool = prompt | permission | <tool>)
   tool TEXT,
   tool_use_id TEXT,
   ok INTEGER,                    -- NULL while in flight, 1 success, 0 failure
@@ -273,11 +275,11 @@ class Friction:
         row = None
         if tool_use_id:
             row = self.db.execute(
-                'SELECT id, ts FROM events WHERE session_id=? AND tool_use_id=? AND ok IS NULL'
-                ' ORDER BY id DESC LIMIT 1', (session_id, tool_use_id)).fetchone()
+                "SELECT id, ts FROM events WHERE session_id=? AND kind='tool' AND tool_use_id=?"
+                ' AND ok IS NULL ORDER BY id DESC LIMIT 1', (session_id, tool_use_id)).fetchone()
         if row is None:
             row = self.db.execute(
-                'SELECT id, ts FROM events WHERE session_id=? AND tool=? AND ok IS NULL'
+                "SELECT id, ts FROM events WHERE session_id=? AND kind='tool' AND tool=? AND ok IS NULL"
                 ' ORDER BY id DESC LIMIT 1', (session_id, tool)).fetchone()
         if row is None:
             return None
@@ -286,6 +288,55 @@ class Friction:
         self.db.execute('UPDATE events SET ok=?, error=?, duration_ms=? WHERE id=?',
                         (1 if ok else 0, redact(error), duration_ms, row['id']))
         return row['id']
+
+    # ---- time spent waiting on the user ----------------------------------
+
+    def open_wait(self, session_id, reason, ts=None):
+        """Start a wait on the user (a turn ended, a permission prompt is up). Idempotent."""
+        if self.db.execute("SELECT 1 FROM events WHERE session_id=? AND kind='wait' AND tool=?"
+                           ' AND ok IS NULL LIMIT 1', (session_id, reason)).fetchone():
+            return None
+        return self.add_event(session_id, 'wait', tool=reason, ts=ts)
+
+    def close_waits(self, session_id, reasons=None, now=None):
+        """End open waits (all, or those for `reasons`) at `now`."""
+        now = now or time.time()
+        rows = self.db.execute("SELECT id, ts, tool FROM events WHERE session_id=? AND kind='wait'"
+                               ' AND ok IS NULL', (session_id,)).fetchall()
+        for row in rows:
+            if reasons is None or row['tool'] in reasons:
+                self.db.execute('UPDATE events SET ok=1, duration_ms=? WHERE id=?',
+                                (max(0, int((now - row['ts']) * 1000)), row['id']))
+
+    def add_wait(self, session_id, reason, start, end, source='hook'):
+        """Record a finished wait, e.g. the run of an AskUserQuestion call."""
+        if end > start:
+            self.add_event(session_id, 'wait', tool=reason, ok=1, ts=start, source=source,
+                           duration_ms=int((end - start) * 1000))
+
+    def waits(self, session_id, lo, hi):
+        """Merged (start, end) intervals the session spent waiting on the user within [lo, hi].
+
+        A wait still open (its hook never closed it) runs until the next tool call."""
+        rows = self.db.execute(
+            "SELECT ts, duration_ms, ok FROM events WHERE session_id=? AND kind='wait' AND ts<?"
+            ' ORDER BY ts', (session_id, hi)).fetchall()
+        spans = []
+        for w in rows:
+            if w['ok'] is None:
+                nxt = self.db.execute("SELECT MIN(ts) m FROM events WHERE session_id=? AND"
+                                      " kind='tool' AND ts>?", (session_id, w['ts'])).fetchone()['m']
+                end = nxt if nxt is not None else hi
+            else:
+                end = w['ts'] + (w['duration_ms'] or 0) / 1000
+            start, end = max(w['ts'], lo), min(end, hi)
+            if end <= start:
+                continue
+            if spans and start <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], end)
+            else:
+                spans.append([start, end])
+        return spans
 
     def has_events(self, session_id):
         return self.db.execute('SELECT 1 FROM events WHERE session_id=? LIMIT 1',
@@ -394,19 +445,29 @@ class Friction:
         """Time from event first_id to end_ts, not counting idle gaps.
 
         A gap between calls longer than IDLE_GAP_S beyond the call's own
-        duration is the session sitting idle (user away, waiting for a prompt),
-        not time the friction cost; only the call's duration is counted for it.
+        duration is the session sitting idle (user away), not time the friction
+        cost; only the call's duration is counted for it. Time spent waiting on
+        the user (recorded `wait` events: between a turn ending and the next
+        prompt, permission prompts, AskUserQuestion) is never counted.
         """
         rows = self.db.execute(
             "SELECT ts, duration_ms FROM events WHERE session_id=? AND kind='tool' AND id>=? AND id<=?"
             ' ORDER BY ts', (session_id, first_id, last_id)).fetchall()
-        total = 0.0
+        if not rows:
+            return 0.0
+        spans = []
         for i, ev in enumerate(rows):
             nxt = rows[i + 1]['ts'] if i + 1 < len(rows) else end_ts
             ran = (ev['duration_ms'] or 0) / 1000
             gap = max(0.0, nxt - ev['ts'])
-            total += gap if gap <= ran + IDLE_GAP_S else ran
-        return total
+            spans.append((ev['ts'], ev['ts'] + (gap if gap <= ran + IDLE_GAP_S else ran)))
+        waits = self.waits(session_id, rows[0]['ts'], max(end_ts, spans[-1][1]))
+        total = 0.0
+        for start, end in spans:
+            total += end - start
+            for ws, we in waits:
+                total -= max(0.0, min(end, we) - max(start, ws))
+        return max(0.0, total)
 
     # ---- items -----------------------------------------------------------
 

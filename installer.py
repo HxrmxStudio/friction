@@ -25,8 +25,10 @@ from pathlib import Path
 APP = Path(__file__).resolve().parent
 HOME = Path.home()
 HOOK_MARK = 'friction_hook.py'
-CLAUDE_EVENTS = ('SessionStart', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop')
-CODEX_EVENTS = ('SessionStart', 'PreToolUse', 'PostToolUse', 'Stop')
+CLAUDE_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PermissionRequest',
+                 'PostToolUse', 'PostToolUseFailure', 'Stop')
+CODEX_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PermissionRequest',
+                'PostToolUse', 'Stop')
 UNITS = ('friction-web.service', 'friction-backfill.service',
          'friction-backfill.timer')
 ENABLE = ('friction-web.service', 'friction-backfill.timer')

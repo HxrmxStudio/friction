@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from friction import fmt_duration, fmt_ts, parse_duration
+from friction import USER_INPUT_TOOLS, fmt_duration, fmt_ts, parse_duration
 from friction_hook import failed, summarize, text_of
 
 IDLE_S = 900            # leave sessions touched more recently than this alone
@@ -57,20 +57,30 @@ def iso_ts(text):
 
 
 def parse_claude(path):
-    """-> (session_id, cwd, [event dicts]) from a Claude Code transcript."""
-    session, cwd, calls, order = None, None, {}, []
+    """-> (session_id, cwd, [event dicts]) from a Claude Code transcript.
+
+    Besides tool calls, the gap between the agent's last message and each
+    prompt the user typed becomes a `wait` event: that is the user's time."""
+    session, cwd, calls, order, waits, last_ts = None, None, {}, [], [], None
     with open(path, errors='replace') as fh:
         for line in fh:
-            if '"tool_use"' not in line and '"tool_result"' not in line:
+            if '"user"' not in line and '"assistant"' not in line:
                 continue
             try:
                 d = json.loads(line)
             except ValueError:
                 continue
-            content = (d.get('message') or {}).get('content')
-            if not isinstance(content, list):
+            if d.get('type') not in ('user', 'assistant'):
                 continue
             ts = iso_ts(d.get('timestamp'))
+            content = (d.get('message') or {}).get('content')
+            if (d['type'] == 'user' and ts and last_ts and not d.get('isMeta')
+                    and not d.get('isCompactSummary') and not d.get('isSidechain')
+                    and is_prompt(content)):
+                waits.append(wait_event('prompt', last_ts, ts))
+            last_ts = ts or last_ts
+            if not isinstance(content, list):
+                continue
             session = session or d.get('sessionId') or d.get('session_id')
             cwd = cwd or d.get('cwd')
             for block in content:
@@ -91,12 +101,37 @@ def parse_claude(path):
                     call['error'] = text_of(block.get('content')) if bad else None
                     if ts:
                         call['duration_ms'] = max(0, int((ts - call['ts']) * 1000))
-    return session, cwd, [calls[i] for i in order if calls[i]['ok'] is not None]
+    return session, cwd, with_waits([calls[i] for i in order if calls[i]['ok'] is not None], waits)
+
+
+def is_prompt(content):
+    """True for a message the user typed, not a tool result fed back to the agent."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    types = {b.get('type') for b in content if isinstance(b, dict)}
+    return 'tool_result' not in types and bool(types & {'text', 'image'})
+
+
+def wait_event(reason, start, end):
+    return {'kind': 'wait', 'ts': start, 'tool': reason, 'tool_use_id': None, 'summary': None,
+            'ok': 1, 'error': None, 'duration_ms': max(0, int((end - start) * 1000))}
+
+
+def with_waits(calls, waits):
+    """Tool calls plus wait events (including the run of each question tool), in time order."""
+    waits = waits + [wait_event(c['tool'], c['ts'], c['ts'] + c['duration_ms'] / 1000)
+                     for c in calls if c['tool'] in USER_INPUT_TOOLS and c['duration_ms']]
+    return sorted(calls + [w for w in waits if w['duration_ms'] > 0], key=lambda ev: ev['ts'])
 
 
 def parse_codex(path):
-    """-> (session_id, cwd, [event dicts]) from a Codex rollout file."""
-    session, cwd, calls, order = None, None, {}, []
+    """-> (session_id, cwd, [event dicts]) from a Codex rollout file.
+
+    The time from a turn ending (task_complete / turn_aborted) to the next
+    turn starting is a `wait` event: the user's time, not the agent's."""
+    session, cwd, calls, order, waits, idle_since = None, None, {}, [], [], None
     with open(path, errors='replace') as fh:
         for line in fh:
             try:
@@ -110,6 +145,13 @@ def parse_codex(path):
                 session, cwd = p.get('session_id') or p.get('id'), p.get('cwd')
                 continue
             kind, ts = p.get('type'), iso_ts(d.get('timestamp'))
+            if d.get('type') == 'event_msg' and ts:
+                if kind in ('task_complete', 'turn_aborted'):
+                    idle_since = idle_since or ts
+                elif kind in ('task_started', 'user_message') and idle_since:
+                    waits.append(wait_event('prompt', idle_since, ts))
+                    idle_since = None
+                continue
             if kind in ('function_call', 'custom_tool_call', 'local_shell_call') and ts:
                 raw = p.get('arguments') if 'arguments' in p else p.get('input', p.get('action'))
                 try:
@@ -137,7 +179,7 @@ def parse_codex(path):
                 call['error'] = error
                 if ts:
                     call['duration_ms'] = max(0, int((ts - call['ts']) * 1000))
-    return session, cwd, [calls[i] for i in order if calls[i]['ok'] is not None]
+    return session, cwd, with_waits([calls[i] for i in order if calls[i]['ok'] is not None], waits)
 
 
 def transcripts(since_ts, now):
@@ -169,7 +211,7 @@ def import_events(fr, session, agent, cwd, path, events):
         fr.touch_session(session, agent, cwd, str(path), ts=events[-1]['ts'])
     project = fr.session(session)['project'] if events else None
     for ev in fresh:
-        fr.add_event(session, 'tool', tool=ev['tool'], tool_use_id=ev['tool_use_id'], ok=ev['ok'],
+        fr.add_event(session, ev.get('kind', 'tool'), tool=ev['tool'], tool_use_id=ev['tool_use_id'], ok=ev['ok'],
                      duration_ms=ev['duration_ms'], summary=ev['summary'], error=ev['error'],
                      ts=ev['ts'], agent=agent, project=project, source='transcript')
     fr.db.commit()

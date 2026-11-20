@@ -161,6 +161,10 @@ Every occurrence records how its wasted time was obtained, and reports keep the 
 | `estimate` | the agent's own `--wasted` guess, used only when no events exist. Marked `~est` in the CLI and "estimated" in the web view |
 | `none` | no events and no estimate |
 
+Measured time leaves out idle gaps (over 5 minutes beyond a call's own run) and any time spent
+waiting on you: from the end of a turn to your next prompt, permission prompts, and questions such
+as `AskUserQuestion`. Pending user input is not friction.
+
 ### Lifecycle
 
 `open` → `resolved` or `wontfix`. Resolved items leave the hot list. A new hit on a resolved item
@@ -271,8 +275,8 @@ Unless you enable tracker sync, everything stays on your machine, in
 | `FRICTION_DIR` | where the database lives (default `~/.local/share/friction`) |
 | `FRICTION_DISABLE=1` | switch the hook off for a process tree |
 
-Hooks are registered for `SessionStart`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` and
-`Stop`. The hook exits 0 on any error, so it cannot break an agent session.
+Hooks are registered for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`,
+`PostToolUse`, `PostToolUseFailure` and `Stop`. The hook exits 0 on any error, so it cannot break an agent session.
 
 ## Uninstall
 
