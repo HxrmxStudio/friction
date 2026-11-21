@@ -227,7 +227,26 @@ def launchd_services(args):
     if not DRY:
         launchctl('kickstart', '-k', f'{domain}/{LAUNCHD_WEB}')
     say(f'restart  {LAUNCHD_WEB}')
+    wait_for_web(args.port)
     say(f'web view http://127.0.0.1:{args.port}')
+
+
+def wait_for_web(port, timeout=45.0):
+    """After a restart, wait until the web view accepts connections, so the installer only
+    reports success (and scripts that curl it next work) once it is serving again."""
+    if DRY:
+        return True
+    import socket
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.25)
+    say(f'warning  web view not answering on port {port} yet; it may still be starting')
+    return False
 
 
 def remove_launchd():
@@ -267,6 +286,7 @@ def services(args):
     # (The backfill runs fresh from the timer and the hooks fresh per call; they need nothing.)
     systemctl('restart', 'friction-web.service')
     say('restart  friction-web.service')
+    wait_for_web(args.port)
     say(f'web view http://127.0.0.1:{args.port}')
 
 
