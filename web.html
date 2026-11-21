@@ -52,6 +52,11 @@ tr.item:hover td { background: var(--panel); }
 .badge { display: inline-block; font-size: 11px; border: 1px solid var(--grid); border-radius: 10px;
   padding: 0 7px; margin-left: 6px; color: var(--ink2); white-space: nowrap; }
 .badge.est { border-color: var(--warning-ink); color: var(--warning-ink); }
+.badge.unv { border-style: dashed; color: var(--muted); }
+.badge.soft { border-color: var(--warning-ink); color: var(--warning-ink); }
+.unv-text { color: var(--muted); font-style: italic; }
+.hint { color: var(--muted); font-size: 12px; font-style: normal; }
+pre .soft { color: var(--warning-ink); }
 .badge.reg { border-color: var(--critical); color: var(--critical); }
 .legend { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; margin: 10px 0 0; }
 .legend .cell { width: 14px; height: 14px; }
@@ -139,6 +144,8 @@ function render(rep) {
       const tip = c ? `${short(d)}: ${c.n} hit${c.n > 1 ? 's' : ''}, ${dur(c.wasted)} wasted` : `${short(d)}: none`;
       return `<div class="cell" data-l="${c ? level(c.wasted || c.n, peak) : 0}" data-tip="${esc(tip)}"></div>`; }).join('');
     const badges = (it.estimated ? `<span class="badge est" title="Wasted time for these occurrences is the agent's estimate, not measured from tool events">~ ${it.estimated} estimated</span>` : '')
+      + (it.verified === false ? `<span class="badge unv" title="Workaround was written by the backfill analyser and is hidden from agents until verified: friction verify ${it.id}">unverified</span>` : '')
+      + (it.soft_calls ? `<span class="badge soft" title="Bad calls in occurrence windows: ${it.hard_calls} hard failures, ${it.soft_calls} soft (call succeeded but the output showed not_found/denied/auth/timeout/retried)">${it.hard_calls} hard · ${it.soft_calls} soft</span>` : '')
       + (it.untimed ? `<span class="badge">${it.untimed} untimed</span>` : '')
       + (it.regressed ? `<span class="badge reg">↺ regressed</span>` : '')
       + (it.status !== 'open' ? `<span class="badge">${esc(it.status)}</span>` : '')
@@ -170,14 +177,18 @@ async function toggle(id, keep) {
     const flag = o.timing === 'estimate' ? '<span class="badge est">~ estimated</span>'
       : o.timing === 'none' ? '<span class="badge">untimed</span>'
       : `<span class="badge">measured: ${o.timing}</span>`;
-    const ev = o.events.map(e => `<span class="${e.ok === 0 ? 'fail' : ''}">${e.ok === 0 ? 'FAIL' : 'ok  '} ${esc(e.tool)}: ${esc((e.summary || '').slice(0, 160))}${e.ok === 0 && e.error ? '\n       → ' + esc(e.error.slice(0, 200)) : ''}</span>`).join('\n');
+    const ev = o.events.map(e => { const soft = e.ok === 1 && e.outcome;
+      return `<span class="${e.ok === 0 ? 'fail' : soft ? 'soft' : ''}">${e.ok === 0 ? 'FAIL' : soft ? 'SOFT' : 'ok  '} ${esc(e.tool)}: ${esc((e.summary || '').slice(0, 160))}${soft ? ' [' + esc(e.outcome) + ']' : ''}${(e.ok === 0 || soft) && e.error ? '\n       → ' + esc(e.error.slice(0, 200)) : ''}</span>`; }).join('\n');
+    const hard = o.events.filter(e => e.ok === 0).length, nsoft = o.events.filter(e => e.ok === 1 && e.outcome).length;
     return `<div class="occ"><div class="meta">${when(o.ts)} · ${esc(o.agent || '?')} / ${esc(o.project || '?')} · <b>${dur(o.wasted_s)}</b>${flag}
       ${o.regression ? '<span class="badge reg">↺ regression</span>' : ''}${o.source === 'backfill' ? '<span class="badge">backfilled</span>' : ''}
-      ${o.tool_calls != null ? ` · ${o.tool_calls} calls, ${o.failed_calls} failed` : ''}</div>
+      ${o.tool_calls != null ? ` · ${o.tool_calls} calls, ${o.failed_calls} bad` + (o.events.length ? ` (${hard} hard, ${nsoft} soft)` : '') : ''}</div>
       ${o.note ? `<div>${esc(o.note)}</div>` : ''}${ev ? `<pre>${ev}</pre>` : ''}</div>`; }).join('');
   row.firstElementChild.innerHTML = `<dl>
     ${it.detail ? `<dt>Detail</dt><dd>${esc(it.detail)}</dd>` : ''}
-    <dt>Workaround</dt><dd>${esc(it.workaround) || '—'}</dd>
+    <dt>Workaround</dt><dd>${it.verified === 0 && it.workaround
+      ? `<span class="badge unv" style="margin:0 6px 0 0">unverified</span><span class="unv-text">${esc(it.workaround)}</span>\n<span class="hint">Written by an LLM reading tool output; hidden from agents. Review it, then run: friction verify ${it.id}</span>`
+      : esc(it.workaround) || '—'}</dd>
     ${it.fix_note ? `<dt>Fix</dt><dd>${esc(it.fix_note)}</dd>` : ''}
     ${it.aliases ? `<dt>Also known as</dt><dd>${esc(it.aliases)}</dd>` : ''}
     <dt>All time</dt><dd>${d.stats.n} hits in ${d.stats.sessions} sessions, ${dur(d.stats.wasted)} wasted, ${it.regressions} regressions</dd></dl>${occ}`;

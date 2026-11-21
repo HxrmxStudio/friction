@@ -321,12 +321,14 @@ def renumber(fr, session, fresh, agent, project):
         new.append(row)
     merged = sorted(old + new, key=lambda r: r['ts'])        # stable: old rows keep id order on ties
     fr.db.execute('DELETE FROM events WHERE session_id=?', (session,))
-    mapping = {}
+    mapping, new_ids = {}, []
     for row in merged:
         cur = fr.db.execute(f"INSERT INTO events({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                             [row[c] for c in cols])
         if 'id' in row:
             mapping[row['id']] = cur.lastrowid
+        else:
+            new_ids.append(cur.lastrowid)
 
     def remap(old_id):
         if old_id is None:
@@ -340,8 +342,16 @@ def renumber(fr, session, fresh, agent, project):
         fr.db.execute('UPDATE occurrences SET from_event=?, to_event=? WHERE id=?',
                       (remap(occ['from_event']), remap(occ['to_event']), occ['id']))
     sess = fr.session(session)
+    # Event ids below the mark count as logged. The imported events are older than every hook
+    # event, so a mark above them would swallow them: put it just before the first imported one.
+    # What was logged before stays logged through the occurrence windows (see NOT_IN_WINDOW_SQL).
+    # The nudge mark is only remapped: the Stop hook does not nag about pre-hook history.
+    mark = remap(sess['mark_event'])
+    first_new = min(new_ids, default=None)
+    if mark and first_new is not None:
+        mark = min(mark, first_new - 1)
     fr.db.execute('UPDATE sessions SET mark_event=?, nudge_event=? WHERE session_id=?',
-                  (remap(sess['mark_event']), remap(sess['nudge_event']), session))
+                  (mark, remap(sess['nudge_event']), session))
 
 
 def import_waits(fr, session, path, agent):
@@ -378,18 +388,20 @@ def retime(fr, args):
             path = occ['transcript']
             if path and Path(path).exists():
                 waits += import_waits(fr, session, path, occ['sagent'] or occ['agent'] or 'claude')
-        new = fr.retime(occ)
-        if new is None:
+        res = fr.remeasure(occ)
+        if res is None:
             skipped += 1
             continue
+        new = res['wasted_s']
         old = occ['wasted_s'] or 0
         before, after = before + old, after + new
-        if abs(new - old) >= 1:
+        moved = any(res[k] != occ[k] for k in ('to_event', 'tool_calls', 'failed_calls'))
+        if abs(new - old) >= 1 or moved:
             changed += 1
             print(f"  occ {occ['id']:>4} #{occ['item_id']:<4} {fmt_duration(old):>8} -> {fmt_duration(new):>8}"
                   f"  {occ['title'][:60]}")
             if not args.dry_run:
-                fr.set_wasted(occ['id'], new)
+                fr.set_wasted(occ['id'], new, res['to_event'], res['tool_calls'], res['failed_calls'])
     if args.dry_run:
         fr.db.rollback()
     else:
@@ -451,7 +463,7 @@ def session_rows(fr, session):
     sess = fr.session(session)
     return fr.db.execute(
         "SELECT * FROM events WHERE session_id=? AND id>? AND kind='tool' AND ok IS NOT NULL"
-        ' ORDER BY id', (session, sess['mark_event'])).fetchall()
+        f' AND {friction.NOT_IN_WINDOW_SQL} ORDER BY id', (session, sess['mark_event'])).fetchall()
 
 
 def cluster_lines(rows, cluster, emitted):

@@ -403,6 +403,75 @@ class Backfill(Base):
                          [('tool', 3000), ('wait', 180000)])
 
 
+class CodexShapes(Base):
+    """Output shapes seen in real ~/.codex/sessions rollouts (content sanitised)."""
+    EXIT1 = ('Chunk ID: 60336c\nWall time: 0.0000 seconds\nProcess exited with code 1\n'
+             'Original token count: 39\nOutput:\nskillsTarget is not defined\n')
+    EXIT0 = ('Chunk ID: 1e546b\nWall time: 0.0000 seconds\nProcess exited with code 0\n'
+             'Original token count: 40\nOutput:\nbin/install.mjs\nREADME.md\n')
+    RUNNING = ('Chunk ID: 58841f\nWall time: 5.0004 seconds\nProcess running with session ID 5\n'
+               'Original token count: 0\nOutput:\n')
+    TIMEOUT = 'Chunk ID: dcd876\nWall time: 1.0018 seconds\nProcess exited with code 124\nOriginal token count: 0\nOutput:\n'
+    NOTFOUND = ('Chunk ID: aa1\nWall time: 0.0 seconds\nProcess exited with code 0\nOriginal token count: 9\n'
+                'Output:\nbash: line 1: frobnicate: command not found\n')
+    LEGACY = 'Exit code: 1\nWall time: 0.2 seconds\nOutput:\nboom\n'
+    SCRIPT_FAILED = [{'type': 'input_text', 'text': 'Script failed\nWall time 0.0 seconds\nOutput:\n'},
+                     {'type': 'input_text', 'text': 'Script error:\napply_patch verification failed: x'}]
+    SCRIPT_OK = [{'type': 'input_text', 'text': 'Script completed\nWall time 1.8 seconds\nOutput:\n'},
+                 {'type': 'input_text', 'text': 'exit code 1 mentioned in content'}]
+
+    def test_failed_on_real_shapes(self):
+        f = friction_hook.failed
+        self.assertTrue(f({'tool_response': self.EXIT1})[0])
+        self.assertTrue(f({'tool_response': self.TIMEOUT})[0])
+        self.assertTrue(f({'tool_response': self.LEGACY})[0])
+        self.assertTrue(f({'tool_response': self.SCRIPT_FAILED})[0])
+        self.assertTrue(f({'tool_response': {'output': self.EXIT1}})[0])
+        self.assertFalse(f({'tool_response': self.EXIT0})[0])
+        self.assertFalse(f({'tool_response': self.RUNNING})[0])
+        self.assertFalse(f({'tool_response': self.SCRIPT_OK})[0])
+        self.assertFalse(f({'tool_response': {'output': self.EXIT0, 'metadata': {'exit_code': 0}}})[0])
+
+    def test_soft_outcome_sees_past_the_header(self):
+        soft = friction_hook.soft_outcome
+        ev = lambda out: {'tool_name': 'exec_command', 'tool_response': out}   # noqa: E731
+        self.assertEqual(soft(ev(self.NOTFOUND), 'frobnicate --x')[0], 'not_found')
+        self.assertEqual(soft(ev(self.EXIT0), 'ls'), (None, None))
+        empty = self.EXIT0.split('Output:')[0] + 'Output:\n'
+        self.assertEqual(friction.unexpected_outcome('exec_command', 'ls /nope', empty), 'empty')
+
+    def test_parse_codex_real_output_shapes(self):
+        path = Path(self.tmp.name) / 'rollout.jsonl'
+        outs = [('exec_command', 'function_call_output', self.EXIT1, 0),
+                ('exec_command', 'function_call_output', self.EXIT0, 1),
+                ('write_stdin', 'function_call_output', self.TIMEOUT, 0),
+                ('exec', 'custom_tool_call_output', self.SCRIPT_FAILED, 0),
+                ('exec', 'custom_tool_call_output', self.SCRIPT_OK, 1),
+                ('exec_command', 'function_call_output', self.NOTFOUND, 1)]
+        lines = [{'type': 'session_meta', 'payload': {'id': 'c2', 'cwd': '/home/x/code/proj'}}]
+        for i, (name, kind, out, _) in enumerate(outs):
+            call = 'custom_tool_call' if kind.startswith('custom') else 'function_call'
+            args = {'input': 'x'} if call == 'custom_tool_call' else {'arguments': json.dumps({'cmd': 'frobnicate'})}
+            lines.append({'type': 'response_item', 'timestamp': f'2026-11-01T00:00:{i * 2:02d}Z',
+                          'payload': {'type': call, 'name': name, 'call_id': f'k{i}', **args}})
+            lines.append({'type': 'response_item', 'timestamp': f'2026-11-01T00:00:{i * 2 + 1:02d}Z',
+                          'payload': {'type': kind, 'call_id': f'k{i}', 'output': out}})
+        path.write_text('\n'.join(json.dumps(x) for x in lines))
+        _, _, events = backfill.parse_codex(path)
+        self.assertEqual([e['ok'] for e in events], [o[3] for o in outs])
+        self.assertEqual(events[-1]['outcome'], 'not_found')
+
+    def test_codex_post_tool_use_payload(self):
+        for i, out in enumerate((self.EXIT1, self.NOTFOUND, self.EXIT0)):
+            kw = dict(session_id='cx', tool_name='Bash', tool_use_id=f't{i}', turn_id='u', cwd='/home/x/code/proj')
+            friction_hook.handle(dict(hook_event_name='PreToolUse', tool_input={'command': 'frobnicate'}, **kw),
+                                 self.fr, 'codex')
+            friction_hook.handle(dict(hook_event_name='PostToolUse', tool_input={'command': 'frobnicate'},
+                                      tool_response=out, **kw), self.fr, 'codex')
+        rows = self.fr.timeline('cx')
+        self.assertEqual([(r['ok'], r['outcome']) for r in rows], [(0, None), (1, 'not_found'), (1, None)])
+
+
 class Windows(Base):
     """Items 1-3: window end, clusters, marks."""
 
@@ -499,6 +568,42 @@ class Windows(Base):
         occ = self.fr.occurrences(item)[0]
         self.fr.set_wasted(occ['id'], 400)                    # as the old rule would have measured
         self.assertEqual(round(self.fr.retime(occ)), 11)
+
+    def test_retime_keeps_explicit_to(self):
+        a = self.call('s', False, 0, dur=2)
+        b = self.call('s', True, 10, dur=1)       # the default resolution call
+        for i in range(10):
+            self.call('s', True, 20 + i)
+        end = self.call('s', True, 40, dur=1)
+        item = self.fr.create('x')
+        res = self.fr.occur(item, session_id='s', from_event=a, to_event=end, now=self.t + 100)
+        occ = self.fr.occurrences(item)[0]
+        self.assertEqual(occ['to_explicit'], 1)
+        self.assertEqual(occ['to_event'], end)
+        self.assertEqual(round(res['wasted_s']), 41)
+        self.assertEqual(self.fr.remeasure(occ)['to_event'], end)
+        self.assertEqual(round(self.fr.retime(occ)), 41)
+        # without --to the default rule applies and the flag stays 0
+        item2 = self.fr.create('y')
+        self.fr.occur(item2, session_id='s', from_event=a, now=self.t + 100)
+        occ2 = self.fr.occurrences(item2)[0]
+        self.assertEqual(occ2['to_explicit'], 0)
+        self.assertEqual(self.fr.remeasure(occ2)['to_event'], b)
+
+    def test_set_wasted_updates_window_fields(self):
+        a = self.call('s', False, 0)
+        self.call('s', True, 5)
+        self.call('s', True, 6)
+        item = self.fr.create('x')
+        self.fr.occur(item, session_id='s', from_event=a, now=self.t + 100)
+        occ = self.fr.occurrences(item)[0]
+        self.fr.set_wasted(occ['id'], 3, to_event=occ['to_event'] + 1, tool_calls=3, failed_calls=1)
+        row = self.fr.occurrences(item)[0]
+        self.assertEqual((row['wasted_s'], row['to_event'], row['tool_calls'], row['failed_calls']),
+                         (3, occ['to_event'] + 1, 3, 1))
+        self.fr.set_wasted(occ['id'], 4)                      # no window given: counts untouched
+        row = self.fr.occurrences(item)[0]
+        self.assertEqual((row['wasted_s'], row['tool_calls']), (4, 3))
 
     def test_event_line_marks_soft_calls(self):
         ev = self.call('s', True, 0, outcome='auth', error='401 Unauthorized', summary='curl x')

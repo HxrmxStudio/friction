@@ -182,7 +182,17 @@ Measured time leaves out idle gaps (over 5 minutes beyond a call's own run) and 
 waiting on you: from the end of a turn to your next prompt, permission prompts, and questions such
 as `AskUserQuestion`. Pending user input is not friction. `friction retime` re-measures
 occurrences logged before this, reading the waits from their session transcripts
-(`--dry-run` to preview).
+(`--dry-run` to preview). It keeps an explicit window end (`--to`, or a backfill finding's
+`to_event`) and refreshes the stored end event and call counts along with the time.
+
+A bad call counts as logged when it is at or below the session's log mark *or* inside the
+event window of any occurrence logged for that session. That is how older transcript events
+imported after hooks were installed mid-session stay reportable (the mark is moved to just
+before them) while failures already logged are not reported again.
+
+Codex output is read through its own wrapper: a non-zero `Process exited with code N` or
+`Exit code: N` header line, or a `Script failed` header from its `exec`/`wait` tools, is a hard
+failure, and soft-failure checks look at the output after that header.
 
 ### Lifecycle
 

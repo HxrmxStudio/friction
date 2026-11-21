@@ -334,7 +334,32 @@ class ImportMidSession(Base):
         occ = self.fr.db.execute('SELECT * FROM occurrences').fetchone()
         ids = {r['id']: r['tool_use_id'] for r in self.fr.db.execute('SELECT id, tool_use_id FROM events')}
         self.assertEqual((ids[occ['from_event']], ids[occ['to_event']]), ('u9', 'u10'))
-        self.assertEqual(ids[self.fr.session('m2')['mark_event']], 'u10')
+        # the mark drops below the imported u1 so it is not swallowed; u9/u10 stay logged
+        # through the occurrence window
+        self.assertEqual(self.fr.session('m2')['mark_event'], 0)
+        self.assertEqual([ids[e['id']] for e in self.fr.unlogged_failures('m2')], ['u1'])
+
+    def test_imported_old_failure_stays_unlogged_when_mark_above(self):
+        h = self.call('m3', False, 100, tuid='k1')
+        h2 = self.call('m3', True, 110, tuid='k2')
+        h3 = self.call('m3', False, 2000, tuid='k3')      # a later failure, never logged
+        item = self.fr.create('x')
+        self.fr.occur(item, session_id='m3', from_event=h, to_event=h2)   # live: sets the mark to h2
+        self.fr.db.execute('UPDATE sessions SET nudge_event=? WHERE session_id=?', (h2, 'm3'))
+        self.fr.db.commit()
+        path = transcript(Path(self.tmp.name) / 'o.jsonl', [
+            use('u1', 'Bash', 'old', self.t + 0, 'm3'), result('u1', 'err', self.t + 1, True, 'm3'),
+            use('u2', 'Bash', 'ok', self.t + 5, 'm3'), result('u2', 'fine', self.t + 6, False, 'm3')])
+        session, cwd, events = backfill.parse_claude(path)
+        backfill.import_events(self.fr, session, 'claude', cwd, path, events)
+        ids = {r['id']: r['tool_use_id'] for r in self.fr.db.execute('SELECT id, tool_use_id FROM events')}
+        self.assertEqual([ids[e['id']] for e in self.fr.unlogged_failures('m3')], ['u1', 'k3'])
+        self.assertEqual([ids[e['id']] for e in self.fr.unnudged_failures('m3')], ['k3'])
+        self.assertEqual(sorted(ids[i] for c in self.fr.clusters('m3') for i in c['bad_ids']), ['k3', 'u1'])
+        # logging the cluster covering the old failure removes it from the unlogged set
+        first = self.fr.clusters('m3')[0]
+        self.fr.occur(item, session_id='m3', from_event=first['from_event'], to_event=first['to_event'])
+        self.assertEqual([ids[e['id']] for e in self.fr.unlogged_failures('m3')], ['k3'])
 
 
 class JevUnit(Base):

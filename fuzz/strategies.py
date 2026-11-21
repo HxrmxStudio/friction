@@ -1,0 +1,125 @@
+"""Shared Hypothesis profiles and structured strategies.
+
+Pure random input rarely gets past the first `if` of a parser, so most strategies here build
+the shapes the real code expects (hook events, transcript lines, tool responses, ADF docs)
+and only mutate parts of them: known-good values mixed with junk, keys sometimes missing,
+types sometimes wrong. That way runs reach the core logic instead of the input checks."""
+import os
+import string
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+from hypothesis import HealthCheck, settings, strategies as st
+
+settings.register_profile('dev', max_examples=100, deadline=None)
+settings.register_profile('ci', max_examples=300, deadline=None, derandomize=True, print_blob=True,
+                          suppress_health_check=[HealthCheck.too_slow])
+settings.register_profile('nightly', max_examples=20_000, deadline=None, print_blob=True,
+                          suppress_health_check=[HealthCheck.too_slow])
+settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
+
+
+@contextmanager
+def temp_friction():
+    """A Friction on a throwaway database."""
+    from friction import Friction
+    with tempfile.TemporaryDirectory() as tmp:
+        fr = Friction(tmp)
+        try:
+            yield fr
+        finally:
+            fr.db.close()
+
+
+# ---- text ----------------------------------------------------------------
+
+# Everything except surrogates (not encodable) and NUL (never in argv or JSON from agents).
+any_text = st.text(st.characters(blacklist_categories=('Cs',), blacklist_characters='\x00'), max_size=80)
+nasty_text = st.sampled_from([
+    '', ' ', '\n', '\r\n', '\t', '…', '‮', '日本語', '🔥' * 3, 'x' * 5000, '[REDACTED]',
+    '"quoted"', "it's", '`backtick`', '$(rm -rf /)', '; DROP TABLE items; --', '%s %d {0}',
+    '[friction:hit uid=1 ts=1]', 'null', '{}', '[]', 'NaN', '-1', '0', '1e309',
+])
+text = st.one_of(any_text, nasty_text)
+short_name = st.text(string.ascii_letters + string.digits + '_-', min_size=1, max_size=12)
+
+# ---- JSON values -----------------------------------------------------------
+
+json_leaf = st.one_of(st.none(), st.booleans(), st.integers(-2**63, 2**63),
+                      st.floats(allow_nan=False, allow_infinity=False), text)
+json_val = st.recursive(json_leaf, lambda c: st.one_of(st.lists(c, max_size=4),
+                                                       st.dictionaries(text, c, max_size=4)),
+                        max_leaves=12)
+
+
+def maybe(strategy, junk=json_val):
+    """Usually `strategy`, sometimes a wrong-typed value."""
+    return st.one_of(strategy, strategy, strategy, junk)
+
+
+def with_optional(required, optional):
+    """fixed_dictionaries where every optional key can also be missing or junk-valued."""
+    return st.fixed_dictionaries(required, optional={k: maybe(v) for k, v in optional.items()})
+
+
+# ---- tool calls ------------------------------------------------------------
+
+TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'WebFetch', 'Agent', 'TodoWrite',
+         'AskUserQuestion', 'ExitPlanMode', 'exec_command', 'shell', 'apply_patch',
+         'mcp__github__get_issue', 'request_user_input']
+tool_name = st.one_of(st.sampled_from(TOOLS), short_name, st.none())
+
+COMMANDS = ['ls', 'ls missing', 'find . -name x', 'grep -r foo .', 'rg foo', 'cat a.txt', 'which nope',
+            'curl -fsS https://api.example.com', 'gh pr list', 'ssh host true', 'git push',
+            'kubectl get pods', 'python3 -m unittest', 'make', 'cd ~/code/friction && ls',
+            'friction log "x" --detail y', 'python3 friction.py bump 3', 'friction timeline',
+            'echo hi | grep -q hi', 'ls | head', 'npm test']
+command = st.one_of(st.sampled_from(COMMANDS),
+                    st.builds(lambda c, n: c.replace('x', str(n)), st.sampled_from(COMMANDS),
+                              st.integers(0, 9)),
+                    st.builds(lambda c, t: f'{c} {t}', st.sampled_from(COMMANDS), text))
+
+OUTPUTS = ['', '(no output)', '(Bash completed with no output)', 'ok', 'No matches found',
+           'Found 0 files', 'Error: something broke', 'Exit code 1', 'Exit code: 127\nzsh: command not found: foo',
+           'zsh: command not found: foo', 'ls: cannot access \'x\': No such file or directory',
+           'cat: a.txt: Permission denied', 'Permission denied (publickey).', 'HTTP 401 Unauthorized',
+           'HTTP/1.1 403 Forbidden', 'Bad credentials', 'curl: (28) Operation timed out',
+           'error: 404 Not Found', 'Process exited with code 2', 'context deadline exceeded',
+           'token=supersecretvalue123 ghp_abcdefghijklmnopqrstuvwxyz1']
+output = st.one_of(st.sampled_from(OUTPUTS), text,
+                   st.builds(lambda a, b: a + '\n' + b, st.sampled_from(OUTPUTS), text))
+
+tool_input = st.one_of(
+    st.fixed_dictionaries({'command': command}, optional={'description': text, 'timeout': st.integers()}),
+    st.fixed_dictionaries({'cmd': st.one_of(command, st.lists(text, max_size=4))}),
+    st.fixed_dictionaries({'file_path': text}, optional={'old_string': text, 'new_string': text}),
+    st.fixed_dictionaries({'pattern': text}, optional={'path': text}),
+    st.fixed_dictionaries({'url': text, 'prompt': text}),
+    st.dictionaries(text, json_val, max_size=3),
+    text, json_val,
+)
+
+tool_response = st.one_of(
+    output,
+    with_optional({}, {'stdout': output, 'stderr': output, 'exit_code': st.integers(-1, 255),
+                       'exitCode': st.integers(-1, 255), 'is_error': st.booleans(),
+                       'isError': st.booleans(), 'success': st.booleans(), 'interrupted': st.booleans(),
+                       'metadata': with_optional({}, {'exit_code': st.integers(-1, 255)}),
+                       'error': output, 'content': output}),
+    st.lists(with_optional({'type': st.just('text')}, {'text': output}), max_size=3),
+    json_val,
+)
+
+# ---- timestamps ------------------------------------------------------------
+
+BASE_TS = 1_750_000_000.0
+epoch = st.floats(BASE_TS, BASE_TS + 86400 * 3, allow_nan=False)
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+iso_ts = st.one_of(epoch.map(iso), epoch.map(iso), st.sampled_from(['', 'not a date', '2025-13-40T99:99:99Z']),
+                   st.none(), st.integers())

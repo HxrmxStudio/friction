@@ -8,6 +8,7 @@ Serves web.html plus two JSON endpoints. It never writes to the database.
 import argparse
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -17,6 +18,43 @@ sys.path.insert(0, str(HERE))
 from friction import Friction  # noqa: E402
 
 
+def _cols(fr, table):
+    return {r[1] for r in fr.db.execute(f'PRAGMA table_info({table})')}
+
+
+def annotate_report(fr, rep, days, project, agent):
+    """Add verified flags and hard/soft bad-call counts per item (columns may not exist yet)."""
+    ids = [it['id'] for it in rep['items']]
+    has_ver = 'verified' in _cols(fr, 'items')
+    has_out = 'outcome' in _cols(fr, 'events')
+    ver = {}
+    if has_ver and ids:
+        ver = {r[0]: r[1] for r in fr.db.execute(
+            f"SELECT id, verified FROM items WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    bad = {}
+    if has_out and ids:
+        where, args = ['o.ts>=?'], [time.time() - days * 86400]
+        for col, val in (('project', project), ('agent', agent)):
+            if val:
+                where.append(f'o.{col}=?')
+                args.append(val)
+        for r in fr.db.execute(
+                "SELECT o.item_id, COALESCE(SUM(e.ok=0), 0) hard,"
+                " COALESCE(SUM(e.ok=1 AND e.outcome IS NOT NULL), 0) soft"
+                ' FROM occurrences o JOIN events e ON e.session_id=o.session_id'
+                ' AND e.id>=o.from_event AND e.id<=COALESCE(o.to_event, o.from_event)'
+                " AND e.kind='tool' WHERE o.from_event IS NOT NULL AND " + ' AND '.join(where)
+                + ' GROUP BY o.item_id', args):
+            bad[r[0]] = (r[1], r[2])
+    for it in rep['items']:
+        it['verified'] = bool(ver.get(it['id'], 1))
+        it['hard_calls'], it['soft_calls'] = bad.get(it['id'], (0, 0))
+        if not it['verified']:
+            it['unverified_workaround'] = it.pop('workaround', '')
+            it['workaround'] = ''
+    return rep
+
+
 def item_payload(fr, item_id):
     item = fr.item(item_id)
     occs = []
@@ -24,7 +62,9 @@ def item_payload(fr, item_id):
         row = dict(occ)
         row['events'] = [dict(ev) for ev in fr.evidence(occ)][:60]
         occs.append(row)
-    return {'item': dict(item), 'stats': dict(fr.stats(item['id'])), 'occurrences': occs}
+    item = dict(item)
+    item.setdefault('verified', 1)
+    return {'item': item, 'stats': dict(fr.stats(item['id'])), 'occurrences': occs}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -51,6 +91,7 @@ class Handler(BaseHTTPRequestHandler):
                 days = max(1, min(366, int(q.get('days', 14))))
                 rep = fr.report(days=days, project=q.get('project') or None,
                                 agent=q.get('agent') or None)
+                rep = annotate_report(fr, rep, days, q.get('project') or None, q.get('agent') or None)
                 return self.send(200, json.dumps(rep), 'application/json')
             if url.path == '/api/item':
                 return self.send(200, json.dumps(item_payload(fr, int(q['id']))), 'application/json')

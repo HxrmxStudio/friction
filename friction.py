@@ -139,6 +139,10 @@ MIGRATIONS = [
     "UPDATE items SET verified=0 WHERE workaround != '' AND EXISTS (SELECT 1 FROM occurrences o"
     " WHERE o.item_id = items.id) AND NOT EXISTS (SELECT 1 FROM occurrences o"
     " WHERE o.item_id = items.id AND o.source = 'live')",
+    # 1 = the window end was given (--to, or a backfill finding's to_event), so `retime` keeps it
+    # instead of re-deriving the resolution call.
+    'ALTER TABLE occurrences ADD COLUMN to_explicit INTEGER NOT NULL DEFAULT 0',
+    "UPDATE occurrences SET to_explicit=1 WHERE source='backfill' AND to_event IS NOT NULL",
 ]
 DIRTY_STATS = 1      # hit count or time wasted changed
 DIRTY_CONTENT = 2    # title, detail, workaround or fix note changed
@@ -264,6 +268,30 @@ _HTTP_404 = re.compile(r'(?i)\bHTTP/[\d.]+\s+404\b|["\']?(?:status|code|http_cod
                        r'|\b404 not found\b|^\s*404\s*$', re.M)
 
 
+# Codex wraps shell/exec output in a header: `Chunk ID: x\nWall time: 0.1 seconds\nProcess exited
+# with code 1\nOriginal token count: 9\nOutput:\n<body>` (exec_command, write_stdin), the older
+# `Exit code: 1\nWall time: 0.1 seconds\nOutput:\n<body>`, and `Script completed|failed\nWall time
+# 0.1 seconds\nOutput:\n<body>` for its exec/wait tools (a list of input_text items, joined).
+CODEX_HEADER = re.compile(
+    r'\A\s*(?:Chunk ID:[^\n]*\n)?'
+    r'(?:(?P<script>Script (?:completed|failed|running)[^\n]*)\n|(?:Exit code:? *(?P<code0>-?\d+)\n))?'
+    r'Wall time:?[^\n]*\n'
+    r'(?:Process (?:exited with code (?P<code>-?\d+)|running[^\n]*)\n)?'
+    r'(?:Original token count:[^\n]*\n)?Output:[ \t]*(?:\n|\Z)')
+
+
+def split_codex_output(text):
+    """(failed?, body) for Codex-wrapped shell output. failed is None when `text` has no such
+    header (then body is `text` itself): True for a non-zero exit code or `Script failed`."""
+    m = CODEX_HEADER.match(text or '')
+    if not m:
+        return None, text
+    code = m.group('code') if m.group('code') is not None else m.group('code0')
+    bad = (code is not None and int(code) != 0) or bool(m.group('script') and
+                                                       m.group('script').startswith('Script failed'))
+    return bad, text[m.end():]
+
+
 def _command_names(cmd):
     """First word of each shell segment of `cmd`, minus cd/env/sudo prefixes."""
     names = []
@@ -344,6 +372,7 @@ def unexpected_outcome(tool, summary, output_text):
     if tool_l in SEARCH_TOOLS:
         return 'empty' if not text or _NO_RESULTS.match(text) else None
     if tool_l in SHELL_TOOLS:
+        text = split_codex_output(text)[1].strip()
         if text in ('(no output)', '(Bash completed with no output)'):
             text = ''
         return _shell_outcome(summary or '', text)
@@ -414,6 +443,11 @@ def _bad(ev):
 SELF_CALL = re.compile(r'(?:^|[;&|]\s*)(?:python3?\s+)?(?:\S*/)?friction(?:\.py)?\s+(?:log|bump|timeline)\b',
                        re.M)
 BAD_SQL ="kind='tool' AND (ok=0 OR outcome IS NOT NULL)"
+# An event inside the window of an occurrence already logged for its session is logged too,
+# whatever the session's mark says (older events imported after hooks were installed).
+NOT_IN_WINDOW_SQL = ('NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.session_id = events.session_id'
+                     ' AND o.from_event IS NOT NULL AND o.to_event IS NOT NULL'
+                     ' AND events.id BETWEEN o.from_event AND o.to_event)')
 # Any friction subcommand. Its exit status is a message to the agent (`log` exits 3 when a
 # similar item exists), not friction, so such calls are never bad calls or retries.
 ANY_SELF_CALL = re.compile(r'(?:^|[;&|]\s*)(?:python3?\s+)?(?:\S*/)?friction(?:\.py)?\s+[a-z]', re.M)
@@ -576,7 +610,8 @@ class Friction:
         sess = self.session(session_id)
         mark = sess['mark_event'] if sess else 0
         return self.db.execute(
-            f'SELECT * FROM events WHERE session_id=? AND id>? AND {BAD_SQL} ORDER BY id',
+            f'SELECT * FROM events WHERE session_id=? AND id>? AND {BAD_SQL} AND {NOT_IN_WINDOW_SQL}'
+            ' ORDER BY id',
             (session_id, mark)).fetchall()
 
     def clusters(self, session_id, events=None):
@@ -592,7 +627,7 @@ class Friction:
             sess = self.session(session_id)
             events = self.db.execute(
                 "SELECT * FROM events WHERE session_id=? AND id>? AND kind='tool' AND ok IS NOT NULL"
-                ' ORDER BY id', (session_id, sess['mark_event'] if sess else 0)).fetchall()
+                f' AND {NOT_IN_WINDOW_SQL} ORDER BY id', (session_id, sess['mark_event'] if sess else 0)).fetchall()
         # Questions to the user are neither friction nor a resolution: the agent was just waiting.
         events = [ev for ev in events if ev['tool'] not in USER_INPUT_TOOLS]
         out, cur, clean = [], None, 0
@@ -678,6 +713,7 @@ class Friction:
         """
         now = now or time.time()
         default_to = None
+        to_event_given = to_event is not None
         if from_event is None:
             found = self.clusters(session_id)
             if not found:
@@ -712,6 +748,7 @@ class Friction:
             'timing': TIMING_TRANSCRIPT if counts['src'] == 'transcript' else TIMING_HOOK,
             'from_event': start['id'],
             'to_event': end_id if end_id is not None else counts['hi'],
+            'to_explicit': 1 if to_event_given else 0,
             'tool_calls': counts['n'],
             'failed_calls': counts['f'],
             'end_ts': end_ts,
@@ -830,12 +867,13 @@ class Friction:
         regression = 1 if item['status'] == 'resolved' and ts >= (item['resolved_at'] or 0) else 0
         cur = self.db.execute(
             'INSERT INTO occurrences(item_id, ts, session_id, agent, project, wasted_s, timing,'
-            ' from_event, to_event, tool_calls, failed_calls, note, source, regression, uid)'
-            ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ' from_event, to_event, tool_calls, failed_calls, note, source, regression, uid,'
+            ' to_explicit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (item_id, ts, session_id, agent, project, wasted, timing,
              win and win['from_event'], win and win['to_event'], win and win['tool_calls'],
              win and win['failed_calls'], redact(note, 1000) or '', source, regression,
-             uuid.uuid4().hex[:16]))
+             uuid.uuid4().hex[:16],
+             1 if win and (win['to_explicit'] or source == 'backfill') else 0))
         if regression:
             self.db.execute("UPDATE items SET status='open', regressions=regressions+1,"
                             ' resolved_at=NULL, updated=? WHERE id=?', (now, item_id))
@@ -982,28 +1020,50 @@ class Friction:
         return {'days': days, 'since': since, 'now': now, 'day_list': day_list, 'total': total,
                 'items': items, 'projects': facets['project'], 'agents': facets['agent']}
 
-    def retime(self, occ):
-        """Measure an event-timed occurrence again over its original window. -> seconds or None."""
+    def remeasure(self, occ):
+        """Measure an event-timed occurrence again over its original window.
+
+        -> {wasted_s, to_event, tool_calls, failed_calls} or None (not event-timed, or the raw
+        events are past retention). An explicit end (--to, or a backfill finding's to_event) is
+        kept; otherwise the end is the resolution call, by the same rule as `window`."""
         if occ['timing'] not in (TIMING_HOOK, TIMING_TRANSCRIPT) or not occ['from_event']:
             return None
         if not self.db.execute('SELECT 1 FROM events WHERE id=? AND session_id=?',
                                (occ['from_event'], occ['session_id'])).fetchone():
             return None       # the raw events are past retention
-        # Backfilled ones ran to an explicit to_event; live ones to the resolution call, found by
-        # the same rule as `window` (as of when it was logged), else to the log call itself.
-        if occ['source'] == 'backfill' and occ['to_event']:
-            return self.active_seconds(occ['session_id'], occ['from_event'], occ['to_event'], occ['ts'])
-        end_id = self._resolution_end(occ['session_id'], occ['from_event'], occ['ts'])
-        if end_id is None:
-            return self.active_seconds(occ['session_id'], occ['from_event'], 1 << 62, occ['ts'])
-        end = self.db.execute('SELECT ts, duration_ms FROM events WHERE id=?', (end_id,)).fetchone()
-        end_ts = min(occ['ts'], end['ts'] + (end['duration_ms'] or 0) / 1000) if occ['ts'] else \
-            end['ts'] + (end['duration_ms'] or 0) / 1000
-        return self.active_seconds(occ['session_id'], occ['from_event'], end_id, end_ts)
+        explicit = (occ['to_explicit'] or occ['source'] == 'backfill') and occ['to_event']
+        if explicit:
+            end_id, end_ts = occ['to_event'], occ['ts']
+            hi = end_id
+        else:
+            end_id = self._resolution_end(occ['session_id'], occ['from_event'], occ['ts'])
+            if end_id is None:
+                hi, end_ts = 1 << 62, occ['ts']
+            else:
+                end = self.db.execute('SELECT ts, duration_ms FROM events WHERE id=?', (end_id,)).fetchone()
+                end_ts = end['ts'] + (end['duration_ms'] or 0) / 1000
+                if occ['ts']:
+                    end_ts = min(occ['ts'], end_ts)
+                hi = end_id
+        counts = self.db.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(ok=0 OR outcome IS NOT NULL), 0) f, MAX(id) hi FROM events"
+            " WHERE session_id=? AND kind='tool' AND id>=? AND id<=? AND ok IS NOT NULL",
+            (occ['session_id'], occ['from_event'], hi)).fetchone()
+        return {'wasted_s': self.active_seconds(occ['session_id'], occ['from_event'], hi, end_ts),
+                'to_event': end_id if end_id is not None else counts['hi'],
+                'tool_calls': counts['n'], 'failed_calls': counts['f']}
 
-    def set_wasted(self, occ_id, wasted_s):
+    def retime(self, occ):
+        """Seconds from `remeasure`, or None."""
+        res = self.remeasure(occ)
+        return res and res['wasted_s']
+
+    def set_wasted(self, occ_id, wasted_s, to_event=None, tool_calls=None, failed_calls=None):
+        """Store a re-measured wasted time, with the window's end and counts when given."""
         row = self.db.execute('SELECT item_id FROM occurrences WHERE id=?', (occ_id,)).fetchone()
-        self.db.execute('UPDATE occurrences SET wasted_s=? WHERE id=?', (wasted_s, occ_id))
+        self.db.execute('UPDATE occurrences SET wasted_s=?, to_event=COALESCE(?, to_event),'
+                        ' tool_calls=COALESCE(?, tool_calls), failed_calls=COALESCE(?, failed_calls)'
+                        ' WHERE id=?', (wasted_s, to_event, tool_calls, failed_calls, occ_id))
         self.mark_dirty(row['item_id'], DIRTY_STATS)
 
     def occurrences(self, item_id, limit=50):

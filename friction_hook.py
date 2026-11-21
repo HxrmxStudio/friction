@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from friction import (USER_INPUT_TOOLS, WEAK_OUTCOMES, RETRY_LOOKAHEAD, Friction, fmt_duration,  # noqa: E402
-                      is_self_call, kick_sync, redact, retry_flags, unexpected_outcome)
+                      is_self_call, kick_sync, redact, retry_flags, split_codex_output, unexpected_outcome)
 
 NUDGE_MIN_FAILURES = 2
 SYNC_EVERY_S = 600
@@ -87,10 +87,14 @@ def failed(event):
         meta = resp.get('metadata')
         if isinstance(meta, dict) and isinstance(meta.get('exit_code'), int) and meta['exit_code'] != 0:
             return True, text_of(resp)
-        return False, None
+        text = text_of(resp)
+        return (True, text) if split_codex_output(text)[0] else (False, None)
     # Plain text: no structured status, so only trust the wrapper's own shapes. Words like
     # "error" or "exit code 1" elsewhere are the *content* (test logs, grep hits), not a failure.
     text = text_of(resp)
+    wrapped, _ = split_codex_output(text)       # Codex's own header carries the exit code
+    if wrapped is not None:
+        return (True, text) if wrapped else (False, None)
     lines = text.strip().splitlines()
     if lines and (FAIL_FIRST_LINE.match(lines[0]) or FAIL_LAST_LINE.match(lines[-1])):
         return True, text
