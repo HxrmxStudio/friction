@@ -16,6 +16,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Install gitleaks (the installer's pinned, SHA-256-checked download)
+        run: |
+          python -c "import installer, sys; sys.exit(0 if installer.install_gitleaks() else 1)"
+          python friction.py doctor
       - run: python -m unittest test_friction test_tracker
       - run: python installer.py --dry-run --no-services
       - name: Real install with launchd services (macOS)

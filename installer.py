@@ -5,21 +5,29 @@
   python3 installer.py --dry-run       show what would change
   python3 installer.py --uninstall     remove everything except the database
 
-It links the `friction` CLI and the agent skill, registers the hook with
+It installs gitleaks (the secret scanner; pinned release, SHA-256 checked, no sudo) into
+~/.local/share/friction/bin unless a recent one is already on PATH, links the
+`friction` CLI and the agent skill, registers the hook with
 Claude Code and Codex where they are installed, and starts the web view and the
 nightly backfill as background services (systemd user units on Linux, launchd
 LaunchAgents on macOS). Existing settings files are
 merged, never replaced, and a `.bak` copy is written before the first change.
 """
 import argparse
+import hashlib
+import io
 import json
 import os
+import platform
 import plistlib
+import re
 import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import urllib.request
 from pathlib import Path
 
 APP = Path(__file__).resolve().parent
@@ -273,6 +281,111 @@ def remove_services():
         systemctl('daemon-reload')
 
 
+# ---- gitleaks (secret scanner) ---------------------------------------------
+
+GITLEAKS_VERSION = '8.30.1'
+GITLEAKS_MIN = (8, 19)           # `gitleaks stdin` needs 8.19+
+# SHA-256 of the official release tarballs (gitleaks_8.30.1_checksums.txt), pinned here so a
+# tampered download or a tampered checksums file at install time cannot pass.
+GITLEAKS_SHA256 = {
+    'darwin_arm64': 'b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5',
+    'darwin_x64': 'dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709',
+    'linux_arm64': 'e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080',
+    'linux_x64': '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
+}
+GITLEAKS_URL = 'https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_{plat}.tar.gz'
+
+
+def gitleaks_home():
+    return HOME / '.local/share/friction/bin'
+
+
+def gitleaks_platform():
+    machine = platform.machine().lower()
+    arch = {'x86_64': 'x64', 'amd64': 'x64', 'arm64': 'arm64', 'aarch64': 'arm64'}.get(machine)
+    system = {'linux': 'linux', 'darwin': 'darwin'}.get(sys.platform)
+    return f'{system}_{arch}' if system and arch else None
+
+
+def gitleaks_version(binary):
+    """(major, minor, patch) of a gitleaks binary, or None if it will not run."""
+    try:
+        out = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', out.stdout)
+    return tuple(int(x) for x in m.groups()) if out.returncode == 0 and m else None
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        return resp.read()
+
+
+def extract_gitleaks(blob, dest):
+    """Write the `gitleaks` member of a release tarball to dest, nothing else."""
+    with tarfile.open(fileobj=io.BytesIO(blob), mode='r:gz') as tar:
+        member = next((m for m in tar.getmembers() if m.isfile() and m.name in ('gitleaks', './gitleaks')),
+                      None)
+        if member is None:
+            raise ValueError('no gitleaks binary in the archive')
+        data = tar.extractfile(member).read()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + '.tmp')
+    tmp.write_bytes(data)
+    tmp.chmod(0o755)
+    os.replace(tmp, dest)
+
+
+def install_gitleaks(download=fetch):
+    """Make a usable gitleaks available without sudo. Returns True when one is (or would be)."""
+    dest = gitleaks_home() / 'gitleaks'
+    for have in (dest, shutil.which('gitleaks')):
+        ver = have and gitleaks_version(have)
+        if ver and ver >= GITLEAKS_MIN:
+            say(f'ok       gitleaks {".".join(map(str, ver))} ({have})')
+            return True
+    plat = gitleaks_platform()
+    if plat not in GITLEAKS_SHA256:
+        print(f'warning  no prebuilt gitleaks for this platform ({sys.platform}/{platform.machine()}).\n'
+              '         Install it yourself (Arch: pacman -S gitleaks; macOS/Linuxbrew: brew install gitleaks),\n'
+              '         or point FRICTION_GITLEAKS at a binary. Until then friction stores no tool text.')
+        return False
+    url = GITLEAKS_URL.format(v=GITLEAKS_VERSION, plat=plat)
+    say(f'download gitleaks {GITLEAKS_VERSION} ({url}) -> {dest}')
+    if DRY:
+        return True
+    try:
+        blob = download(url)
+    except (OSError, ValueError) as exc:
+        print(f'warning  could not download gitleaks: {exc}\n'
+              '         Install it yourself (pacman -S gitleaks / brew install gitleaks) and re-run.')
+        return False
+    got = hashlib.sha256(blob).hexdigest()
+    if got != GITLEAKS_SHA256[plat]:
+        print(f'error    gitleaks download failed its SHA-256 check (expected {GITLEAKS_SHA256[plat]},'
+              f' got {got}); not installed.')
+        return False
+    try:
+        extract_gitleaks(blob, dest)
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        print(f'error    could not unpack gitleaks: {exc}')
+        return False
+    if not gitleaks_version(dest):
+        print(f'error    {dest} does not run on this machine; install gitleaks yourself.')
+        return False
+    say(f'gitleaks {dest}')
+    return True
+
+
+def remove_gitleaks():
+    d = gitleaks_home()
+    if d.is_dir():
+        say(f'remove   {d}')
+        if not DRY:
+            shutil.rmtree(d)
+
+
 # ---- entry point ---------------------------------------------------------
 
 def check():
@@ -309,6 +422,7 @@ def main():
             hooks(args, remove=True)
         if not args.no_services:
             remove_services()
+        remove_gitleaks()
         say('Uninstalled. Your data is still in ~/.local/share/friction (delete it to forget).')
         return 0
 
@@ -316,6 +430,7 @@ def main():
     if not DRY:
         for name in ('friction.py', HOOK_MARK, 'web.py'):
             (APP / name).chmod((APP / name).stat().st_mode | 0o111)
+    install_gitleaks()
     link(APP / 'friction.py', cli)
     for d in skill_dirs():
         link(APP / 'SKILL.md', d / 'SKILL.md')

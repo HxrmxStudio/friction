@@ -7,8 +7,18 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import fake_gitleaks
 import tracker
 from friction import Friction
+
+
+def setUpModule():
+    global _cleanup
+    _cleanup = fake_gitleaks.install()
+
+
+def tearDownModule():
+    _cleanup()
 
 
 class FakeJira:

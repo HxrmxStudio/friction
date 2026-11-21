@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 """Tests for friction. Run: python3 -m unittest -v test_friction"""
+import io
 import json
+import os
+import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 import backfill
+import fake_gitleaks
 import friction
 import friction_hook
 from friction import Friction
 
 
+def setUpModule():
+    global _cleanup
+    _cleanup = fake_gitleaks.install()
+    os.environ['FRICTION_SCRUB_SYNC'] = '1'     # hooks scrub in-process; TestScrub covers the pipe
+
+
+def tearDownModule():
+    os.environ.pop('FRICTION_SCRUB_SYNC', None)
+    _cleanup()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
+        friction._SCAN_CACHE.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.fr = Friction(self.tmp.name)
         self.t = 1_000_000.0
@@ -31,13 +48,286 @@ class Base(unittest.TestCase):
                                  ts=self.t + at, source=source, outcome=outcome)
 
 
+class Redaction(unittest.TestCase):
+    """redact() delegates to gitleaks; these run against the fake from fake_gitleaks.py."""
+
+    def setUp(self):
+        friction._SCAN_CACHE.clear()
+        self.env = mock.patch.dict('os.environ')
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_findings_are_replaced_with_their_rule(self):
+        out = friction.redact('curl x ghp_abcdefghijklmnopqrstuvwxyz1\nkey AKIAABCDEFGHIJKLMNOP  ok')
+        self.assertEqual(out, 'curl x [REDACTED:github-pat]\nkey [REDACTED:aws-access-token] ok')
+
+    def test_clean_text_only_has_whitespace_collapsed(self):
+        self.assertEqual(friction.redact('  ls   -la\t/tmp  '), 'ls -la /tmp')
+        self.assertEqual(friction.redact(''), '')
+        self.assertIsNone(friction.redact(None))
+        self.assertEqual(friction.redact({'a': 1}), '{"a": 1}')
+        out = friction.redact('x' * 5000)
+        self.assertEqual(len(out), friction.SUMMARY_MAX)
+        self.assertTrue(out.endswith('…'))
+
+    def test_secret_is_removed_everywhere_it_occurs(self):
+        out = friction.redact('SECRETVALabc12 then again SECRETVALabc12')
+        self.assertNotIn('abc12', out)
+        self.assertEqual(out.count('[REDACTED:generic-api-key]'), 2)
+
+    def test_redact_many_batches_into_one_process(self):
+        log = Path(tempfile.mkdtemp()) / 'runs'
+        self.addCleanup(lambda: log.unlink() if log.exists() else None)
+        os.environ['FAKE_GL_LOG'] = str(log)
+        out = friction.redact_many(['a ghp_abcdefghijklmnopqrstuvwxyz1', None, '  ', 'plain', 'SECRETVALzz'],
+                                   [100, 100, 100, 100, 5])
+        self.assertEqual(out, ['a [REDACTED:github-pat]', None, '', 'plain', '[RED…'])
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        friction.redact_many(['a ghp_abcdefghijklmnopqrstuvwxyz1'], 100)     # cached: no new run
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
+    def test_add_event_scans_summary_and_error_once(self):
+        log = Path(tempfile.mkdtemp()) / 'runs'
+        self.addCleanup(lambda: log.unlink() if log.exists() else None)
+        os.environ['FAKE_GL_LOG'] = str(log)
+        with tempfile.TemporaryDirectory() as tmp:
+            fr = Friction(tmp)
+            fr.touch_session('s', 'claude')
+            fr.add_event('s', 'tool', tool='Bash', summary='x ghp_abcdefghijklmnopqrstuvwxyz1', error='boom')
+            row = fr.timeline('s')[0]
+            fr.db.close()
+        self.assertEqual((row['summary'], row['error']), ('x [REDACTED:github-pat]', 'boom'))
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
+    def test_scanner_failures_store_no_text(self):
+        for mode in ('error', 'garbage', 'timeout'):
+            friction._SCAN_CACHE.clear()
+            os.environ['FAKE_GL_MODE'] = mode
+            with mock.patch.object(friction, 'SCAN_TIMEOUT_S', 0.3):
+                self.assertIsNone(friction.redact('ls -la'), mode)
+                self.assertEqual(friction.redact_many(['a', None, '']), [None, None, ''], mode)
+
+    def test_missing_scanner_stores_no_text(self):
+        os.environ['FRICTION_GITLEAKS'] = '/nonexistent/gitleaks'
+        self.assertIsNone(friction.redact('ls -la'))
+        ok, why = friction.scanner_status()
+        self.assertFalse(ok)
+        self.assertIn('stores no tool-call text', why)
+        with tempfile.TemporaryDirectory() as tmp:
+            fr = Friction(tmp)
+            fr.touch_session('s', 'claude')
+            fr.add_event('s', 'tool', tool='Bash', summary='ls', error='boom')
+            row = fr.timeline('s')[0]
+            self.assertEqual((row['tool'], row['summary'], row['error']), ('Bash', None, None))
+            with self.assertRaises(ValueError) as cm:        # explicit writes refuse instead
+                fr.create('a title')
+            self.assertIn('gitleaks', str(cm.exception))
+            fr.db.close()
+
+    def test_start_context_warns_when_scanner_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fr = Friction(tmp)
+            self.assertNotIn('gitleaks', friction_hook.start_context(fr))
+            os.environ['FRICTION_GITLEAKS'] = '/nonexistent/gitleaks'
+            ctx = friction_hook.start_context(fr)
+            fr.db.close()
+        self.assertIn('friction warning: gitleaks is not installed', ctx)
+
+    def test_scanner_flags(self):
+        log = Path(tempfile.mkdtemp()) / 'runs'
+        self.addCleanup(lambda: log.unlink() if log.exists() else None)
+        os.environ['FAKE_GL_LOG'] = str(log)
+        friction.redact('hello')
+        args = log.read_text().split()
+        for flag in ('stdin', '--no-banner', '--report-format', 'json', '--report-path', '-',
+                     '--exit-code', '0', '--ignore-gitleaks-allow'):
+            self.assertIn(flag, args)
+
+    def test_no_pattern_scrubber_is_left(self):
+        self.assertFalse(hasattr(friction, 'SECRET_PATTERNS'))
+
+
+class TestScrub(unittest.TestCase):
+    """The hook stores no text itself: raw text goes down a pipe to `friction.py scrub`."""
+    TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz1'
+
+    def setUp(self):
+        friction._SCAN_CACHE.clear()
+        self.env = mock.patch.dict('os.environ')
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        os.environ.pop('FRICTION_SCRUB_SYNC', None)       # the real, asynchronous path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.environ['FRICTION_DIR'] = self.tmp.name        # what the scrubber child opens
+        self.fr = Friction(self.tmp.name)
+        self.addCleanup(self.fr.db.close)
+
+    def handle(self, name, **kw):
+        return friction_hook.handle(dict(hook_event_name=name, session_id='s', **kw), self.fr, 'claude')
+
+    def pre(self, cmd, tid='t1'):
+        self.handle('PreToolUse', tool_name='Bash', tool_use_id=tid, cwd='/home/x/code/p',
+                    tool_input={'command': cmd})
+
+    def run_scrub(self, payload):
+        with mock.patch('sys.stdin', io.StringIO(payload.decode())):
+            self.assertEqual(friction.main(['scrub']), 0)
+
+    def capture(self):
+        """Patch Popen; returns the list of (args, kwargs, bytes written to the pipe)."""
+        calls = []
+
+        class Pipe(io.BytesIO):
+            def close(self):
+                self.done = self.getvalue()
+                super().close()
+
+        real = subprocess.Popen
+
+        def fake_popen(args, **kw):
+            if args[-1] != 'scrub':               # gitleaks runs for real (the fake script)
+                return real(args, **kw)
+            proc = mock.Mock()
+            proc.stdin = Pipe()
+            calls.append((args, kw, proc.stdin))
+            return proc
+        p = mock.patch('subprocess.Popen', fake_popen)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def raw_db_bytes(self):
+        return b''.join(p.read_bytes() for p in Path(self.tmp.name).glob('friction.db*'))
+
+    def test_hook_writes_no_text_and_pipes_raw_text_to_a_detached_scrubber(self):
+        calls = self.capture()
+        self.pre(f'gh auth {self.TOKEN}')
+        self.handle('PostToolUseFailure', tool_name='Bash', tool_use_id='t1', error=f'401 {self.TOKEN}')
+        row = self.fr.timeline('s')[0]
+        self.assertEqual((row['ok'], row['summary'], row['error']), (0, None, None))
+        self.assertNotIn(self.TOKEN.encode(), self.raw_db_bytes())
+        self.assertEqual(len(calls), 2)
+        args, kw, pipe = calls[0]
+        self.assertEqual(args[1:], [str(Path(friction.__file__).resolve()), 'scrub'])
+        self.assertTrue(kw['start_new_session'])
+        self.assertEqual(kw['stdout'], subprocess.DEVNULL)
+        self.assertNotIn(self.TOKEN, ' '.join(args))
+        self.assertIn(self.TOKEN.encode(), pipe.done)
+        for _, _, pipe in calls:                      # and what the child does with it
+            self.run_scrub(pipe.done)
+        row = self.fr.timeline('s')[0]
+        self.assertEqual((row['summary'], row['error']),
+                         ('gh auth [REDACTED:github-pat]', '401 [REDACTED:github-pat]'))
+        self.assertNotIn(self.TOKEN.encode(), self.raw_db_bytes())
+
+    def test_late_scrub_only_touches_text_columns(self):
+        calls = self.capture()
+        self.pre(f'curl {self.TOKEN}')
+        self.handle('PostToolUseFailure', tool_name='Bash', tool_use_id='t1', error='boom')
+        before = dict(self.fr.timeline('s')[0])
+        self.run_scrub(calls[1][2].done)              # the scrub for Post lands first
+        self.run_scrub(calls[0][2].done)              # then the one for Pre, after Post finished
+        after = dict(self.fr.timeline('s')[0])
+        for col in ('ok', 'outcome', 'duration_ms', 'tool', 'ts'):
+            self.assertEqual(before[col], after[col], col)
+        self.assertEqual((after['ok'], after['summary'], after['error']),
+                         (0, 'curl [REDACTED:github-pat]', 'boom'))
+        self.run_scrub(calls[1][2].done)              # re-running never overwrites scrubbed text
+        self.assertEqual(self.fr.timeline('s')[0]['error'], 'boom')
+
+    def test_soft_outcome_keeps_bare_outcome_until_scrubbed(self):
+        calls = self.capture()
+        self.pre('ls /nope')
+        self.handle('PostToolUse', tool_name='Bash', tool_use_id='t1', tool_input={'command': 'ls /nope'},
+                    tool_response={'stdout': '', 'stderr': f"ls: cannot access '/nope/{self.TOKEN}': "
+                                                           'No such file or directory'})
+        row = self.fr.timeline('s')[0]
+        self.assertEqual((row['ok'], row['outcome'], row['error']), (1, 'not_found', 'not_found'))
+        for _, _, pipe in calls:
+            self.run_scrub(pipe.done)
+        row = self.fr.timeline('s')[0]
+        self.assertEqual(row['outcome'], 'not_found')
+        self.assertIn('[REDACTED:github-pat]', row['error'])
+        self.assertNotIn(self.TOKEN, row['error'])
+
+    def test_self_call_and_guess_session_work_without_a_stored_summary(self):
+        self.capture()
+        self.pre('friction log "x" --detail y', tid='a')
+        row = self.fr.timeline('s')[0]
+        self.assertIsNone(row['summary'])
+        self.assertEqual(self.fr.db.execute('SELECT self_call FROM events').fetchone()[0], 2)
+        self.assertEqual(self.fr.guess_session(env={}), 's')
+        # exiting 3 ("bump instead") is not a failure, with no summary in sight
+        self.handle('PostToolUseFailure', tool_name='Bash', tool_use_id='a', error='exit 3')
+        self.assertEqual(self.fr.db.execute('SELECT ok, error FROM events').fetchone()[:], (1, None))
+        # and a payload that has no tool_input falls back to the stored self_call
+        self.pre('friction list', tid='b')
+        self.handle('PostToolUseFailure', tool_name='Bash', tool_use_id='b', error='exit 3')
+        self.assertEqual(self.fr.db.execute('SELECT ok FROM events WHERE tool_use_id="b"').fetchone()[0], 1)
+
+    def test_retry_detection_uses_scrubbed_summaries_and_self_calls_are_exempt(self):
+        calls = self.capture()
+        self.pre('pytest -x tests/a', tid='1')
+        self.handle('PostToolUse', tool_name='Bash', tool_use_id='1', tool_response='ok')
+        for _, _, pipe in calls:
+            self.run_scrub(pipe.done)
+        self.pre('pytest -x tests/a', tid='2')               # near-identical re-run
+        self.assertEqual(self.fr.timeline('s')[0]['outcome'], 'retried')
+
+    def test_no_scanner_means_no_process_and_no_text(self):
+        calls = self.capture()
+        os.environ['FRICTION_GITLEAKS'] = '/nonexistent/gitleaks'
+        self.pre(f'gh auth {self.TOKEN}')
+        self.assertEqual(calls, [])
+        self.assertIsNone(self.fr.timeline('s')[0]['summary'])
+        self.assertNotIn(self.TOKEN.encode(), self.raw_db_bytes())
+
+    def test_scrubber_that_cannot_start_leaves_null_text(self):
+        with mock.patch('subprocess.Popen', side_effect=OSError('no fork')):
+            self.pre('ls')
+        self.assertIsNone(self.fr.timeline('s')[0]['summary'])
+
+    def test_real_background_scrubber_end_to_end(self):
+        self.pre(f'gh auth {self.TOKEN}')
+        deadline = time.time() + 15
+        while time.time() < deadline and self.fr.timeline('s')[0]['summary'] is None:
+            time.sleep(0.1)
+        self.assertEqual(self.fr.timeline('s')[0]['summary'], 'gh auth [REDACTED:github-pat]')
+
+    def test_scrub_command_rejects_garbage(self):
+        with mock.patch('sys.stdin', io.StringIO('not json')):
+            self.assertEqual(friction.main(['scrub']), 1)
+
+
+REAL_GITLEAKS = friction.gitleaks_path()     # looked up at import, before the fake is installed
+
+
+@unittest.skipUnless(REAL_GITLEAKS, 'gitleaks not installed')
+class RealGitleaks(unittest.TestCase):
+    """Only runs where a real gitleaks is installed (CI installs one)."""
+
+    def setUp(self):
+        friction._SCAN_CACHE.clear()
+        self.env = mock.patch.dict('os.environ')
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        os.environ['FRICTION_GITLEAKS'] = REAL_GITLEAKS   # not the module-wide fake
+
+    def test_tokens_are_redacted_and_prose_is_not(self):
+        github = 'ghp_' + 'aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1gH3jK5'
+        aws = 'AKIAQYLPMN5HHHFPZAM2'
+        out = friction.redact(f'gh auth with {github} and aws {aws}')
+        self.assertNotIn(github, out)
+        self.assertNotIn(aws, out)
+        self.assertIn('[REDACTED:', out)
+        for text in ('Authorization set to MediaBrowser Token="<key>"',
+                     'the build failed because the tests were slow; retry after clearing the cache'):
+            self.assertEqual(friction.redact(text), text)
+        self.assertTrue(friction.scanner_status()[0])
+
+
 class Helpers(unittest.TestCase):
-    def test_redact(self):
-        out = friction.redact('curl -H "Authorization: Bearer abcdefghijklmnop123" x ghp_abcdefghijklmnopqrstuvwxyz1 '
-                              'API_KEY=supersecretvalue https://user:hunter2@host/')
-        for secret in ('abcdefghijklmnop123', 'ghp_abc', 'supersecretvalue', 'hunter2'):
-            self.assertNotIn(secret, out)
-        self.assertLessEqual(len(friction.redact('x' * 5000)), friction.SUMMARY_MAX)
 
     def test_durations(self):
         self.assertEqual(friction.parse_duration('90'), 90)

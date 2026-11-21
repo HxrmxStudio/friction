@@ -30,8 +30,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from friction import (USER_INPUT_TOOLS, WEAK_OUTCOMES, RETRY_LOOKAHEAD, Friction, fmt_duration,  # noqa: E402
-                      is_self_call, kick_sync, redact, retry_flags, split_codex_output, unexpected_outcome)
+from friction import (SUMMARY_MAX, USER_INPUT_TOOLS, WEAK_OUTCOMES, RETRY_LOOKAHEAD, Friction, fmt_duration,  # noqa: E402
+                      is_self_call, kick_sync, redact, retry_flags, scanner_status, split_codex_output,
+                      unexpected_outcome)
 
 NUDGE_MIN_FAILURES = 2
 SYNC_EVERY_S = 600
@@ -118,7 +119,7 @@ def soft_outcome(event, summary):
     outcome = unexpected_outcome(event.get('tool_name'), summary, out)
     if outcome is None or outcome in WEAK_OUTCOMES:
         return None, None
-    return outcome, redact(' '.join(out.split())[:300], 200) or outcome
+    return outcome, ' '.join(out.split())[:300] or outcome       # raw: scrubbed later, see flush_scrub
 
 
 def safe_title(title):
@@ -135,6 +136,9 @@ def start_context(fr):
         ' similar existing items so you can `friction bump <id>` instead. Add `--workaround "..."`'
         ' if you got past it. What counts as friction is your call. `friction --help` for more.'
     ]
+    ok, why = scanner_status()
+    if not ok:
+        lines.append('friction warning: ' + why)
     hot = fr.hot()
     if hot:
         lines.append('Hot friction right now (avoid these; bump the id if you hit one anyway):')
@@ -158,7 +162,46 @@ def nudge_text(fails):
             ' just normal work, ignore this and finish.')
 
 
+def queue_scrub(pending, event_id, summary=None, error=None, provisional=None, error_limit=SUMMARY_MAX):
+    """Remember raw text to scan for an event (cut like redact() cuts it: limit * 8 characters)."""
+    item = {'id': event_id, 'provisional': provisional, 'error_limit': error_limit}
+    if summary:
+        item['summary'] = summary[:SUMMARY_MAX * 8]
+    if error:
+        item['error'] = error[:error_limit * 8] if isinstance(error, str) else str(error)[:error_limit * 8]
+    pending.append(item)
+
+
+def flush_scrub(fr, items):
+    """Hand raw text to a detached `friction.py scrub` over a pipe; it writes the scanned text to
+    the events a moment later. Raw text lives only in the pipe and that process: never in the DB,
+    a file, argv or the environment. With FRICTION_SCRUB_SYNC=1 (tests) it is scrubbed in-process.
+    If gitleaks is missing or the scrubber cannot start, the rows simply keep NULL text."""
+    items = [it for it in items if it.get('summary') or it.get('error')]
+    if not items or not scanner_status()[0]:
+        return
+    if os.environ.get('FRICTION_SCRUB_SYNC'):
+        fr.scrub_events(items)
+        return
+    import subprocess
+    try:
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve().parent / 'friction.py'),
+                                 'scrub'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        proc.stdin.write(json.dumps({'items': items}).encode('utf-8', 'replace'))
+        proc.stdin.close()
+    except (OSError, ValueError):
+        pass
+
+
 def handle(event, fr, agent):
+    pending = []
+    out = handle_event(event, fr, agent, pending)
+    flush_scrub(fr, pending)
+    return out
+
+
+def handle_event(event, fr, agent, pending):
     name = event.get('hook_event_name')
     session = event.get('session_id') or event.get('thread_id')
     if not session:
@@ -189,40 +232,50 @@ def handle(event, fr, agent):
         recent = fr.db.execute(
             "SELECT * FROM events WHERE session_id=? AND kind='tool' ORDER BY id DESC LIMIT ?",
             (session, RETRY_LOOKAHEAD)).fetchall()[::-1]
-        seq = [dict(r) for r in recent] + [dict(tool=event.get('tool_name'), summary=redact(summary),
+        # Stored summaries are scrubbed later, so a previous call whose scrub is still pending has
+        # a NULL summary and cannot match: that retry flag is missed (rare: calls are seconds apart).
+        seq = [dict(r) for r in recent] + [dict(tool=event.get('tool_name'), summary=summary,
                                                 ok=None, outcome=None, ts=time.time())]
         for idx in retry_flags(seq):
             if recent[idx]['ok'] == 1:        # hard failures already count; in-flight ones are ignored
                 fr.flag_retry(session, recent[idx]['id'])
-        fr.add_event(session, 'tool', tool=event.get('tool_name'),
-                     tool_use_id=event.get('tool_use_id'), summary=summary,
-                     agent=agent, project=sess['project'] if sess else None)
+        eid = fr.add_event(session, 'tool', tool=event.get('tool_name'),
+                           tool_use_id=event.get('tool_use_id'), summary=summary,
+                           agent=agent, project=sess['project'] if sess else None, defer_scan=True)
+        queue_scrub(pending, eid, summary=summary)
     elif name in ('PostToolUse', 'PostToolUseFailure'):
         bad, error = failed(event)
         outcome = None
         summary = summarize(event.get('tool_name'), event.get('tool_input'))
+        self_call = is_self_call(summary)
         if summary is None and event.get('tool_use_id'):      # payload without tool_input
-            row = fr.db.execute('SELECT summary FROM events WHERE session_id=? AND tool_use_id=?'
+            row = fr.db.execute('SELECT self_call FROM events WHERE session_id=? AND tool_use_id=?'
                                 ' ORDER BY id DESC LIMIT 1', (session, event['tool_use_id'])).fetchone()
-            summary = row['summary'] if row else None
-        if is_self_call(summary):         # e.g. `friction log` exiting 3 to say "bump instead"
+            self_call = bool(row and row['self_call'])        # the stored summary may not be scrubbed yet
+        if self_call:                     # e.g. `friction log` exiting 3 to say "bump instead"
             bad, error = False, None
         elif not bad:
             outcome, error = soft_outcome(event, summary)
         fr.close_waits(session, ('permission',))
         done = fr.finish_event(session, event.get('tool_name'), event.get('tool_use_id'),
                                ok=not bad, error=error, duration_ms=event.get('duration_ms'),
-                               outcome=outcome)
+                               outcome=outcome, defer_scan=True)
+        if done is not None:
+            queue_scrub(pending, done, error=error, provisional=outcome,
+                        error_limit=200 if outcome else SUMMARY_MAX)
         if done is not None and event.get('tool_name') in USER_INPUT_TOOLS:
             start = fr.db.execute('SELECT ts FROM events WHERE id=?', (done,)).fetchone()['ts']
             fr.add_wait(session, event.get('tool_name'), start, time.time())
         if done is None:      # no PreToolUse seen (hook added mid-session): record it untimed
             sess = fr.session(session)
-            fr.add_event(session, 'tool', tool=event.get('tool_name'),
-                         tool_use_id=event.get('tool_use_id'), ok=0 if bad else 1,
-                         duration_ms=event.get('duration_ms'), error=error, outcome=outcome,
-                         summary=summarize(event.get('tool_name'), event.get('tool_input')),
-                         agent=agent, project=sess['project'] if sess else None)
+            raw = summarize(event.get('tool_name'), event.get('tool_input'))
+            eid = fr.add_event(session, 'tool', tool=event.get('tool_name'),
+                               tool_use_id=event.get('tool_use_id'), ok=0 if bad else 1,
+                               duration_ms=event.get('duration_ms'), error=error, outcome=outcome,
+                               summary=raw, agent=agent, project=sess['project'] if sess else None,
+                               defer_scan=True)
+            queue_scrub(pending, eid, summary=raw, error=error, provisional=outcome,
+                        error_limit=200 if outcome else SUMMARY_MAX)
     elif name == 'Stop':
         fails = [] if event.get('stop_hook_active') else fr.unnudged_failures(session)
         if len(fails) >= NUDGE_MIN_FAILURES:

@@ -14,12 +14,22 @@ from types import SimpleNamespace
 from unittest import mock
 
 import backfill
+import fake_gitleaks
 import jev
 from friction import Friction
 
 
 def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def setUpModule():
+    global _cleanup
+    _cleanup = fake_gitleaks.install()
+
+
+def tearDownModule():
+    _cleanup()
 
 
 class Base(unittest.TestCase):

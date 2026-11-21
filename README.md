@@ -45,10 +45,15 @@ work but are not tested.
 The installer is safe to re-run, and re-running it updates. It:
 
 1. clones the repo to `~/.local/share/friction/app`
-2. links the `friction` command into `~/.local/bin`
-3. links the agent skill into `~/.agents/skills`, `~/.claude/skills` and `~/.codex/skills`
-4. adds the hook to `~/.claude/settings.json` and `~/.codex/hooks.json` (merged with what is there, with a `.bak` copy saved first)
-5. starts the web view on <http://127.0.0.1:8798> and a nightly backfill, as background services
+2. installs [gitleaks](https://github.com/gitleaks/gitleaks), which scrubs secrets from everything
+   friction stores. It uses `gitleaks` from your `PATH` if it is 8.19 or newer; otherwise it downloads
+   the pinned release (8.30.1) to `~/.local/share/friction/bin/gitleaks`, checked against SHA-256
+   hashes built into the installer, with no sudo. On an unsupported platform it tells you to
+   `pacman -S gitleaks` or `brew install gitleaks`. Without gitleaks friction stores no tool text
+3. links the `friction` command into `~/.local/bin`
+4. links the agent skill into `~/.agents/skills`, `~/.claude/skills` and `~/.codex/skills`
+5. adds the hook to `~/.claude/settings.json` and `~/.codex/hooks.json` (merged with what is there, with a `.bak` copy saved first)
+6. starts the web view on <http://127.0.0.1:8798> and a nightly backfill, as background services
    that come back at login: systemd user units on Linux, launchd LaunchAgents on macOS
 
 Steps for an agent you do not have installed are skipped.
@@ -290,8 +295,12 @@ switch that `--enable` and `--disable` flip; you can also edit it by hand.
 Unless you enable tracker sync, everything stays on your machine, in
 `~/.local/share/friction/friction.db`.
 
-- Tool input and error text are cut to 500 characters and scrubbed of obvious secrets (tokens,
-  keys, passwords in URLs) before they are stored. Treat this as a safety net, not a guarantee.
+- Tool input and error text are cut to 500 characters and scrubbed by [gitleaks](https://github.com/gitleaks/gitleaks)
+  before they are stored: each finding is replaced with `[REDACTED:<rule>]`. friction has no scrubber
+  of its own, so it finds what gitleaks' default rules find and no more; treat it as a safety net,
+  not a guarantee. If gitleaks is missing, times out or fails, nothing textual is stored (the call
+  is still counted, with no summary or error), `friction log` and the other commands that write text
+  refuse, and SessionStart says so. `friction doctor` checks the scanner.
 - Raw tool events are deleted after 30 days. Items and occurrences are kept.
 - The web view is read-only and listens on `127.0.0.1` only.
 - `friction backfill` sends transcript excerpts to the model through your own `claude` CLI. Do not
@@ -309,6 +318,7 @@ Unless you enable tracker sync, everything stays on your machine, in
 | Variable | Effect |
 |---|---|
 | `FRICTION_DIR` | where the database lives (default `~/.local/share/friction`) |
+| `FRICTION_GITLEAKS` | path of the gitleaks binary (default: `~/.local/share/friction/bin/gitleaks`, then `PATH`) |
 | `FRICTION_DISABLE=1` | switch the hook off for a process tree |
 
 ### Jev classifier (optional)
@@ -343,14 +353,14 @@ Hooks are registered for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `Perm
 ~/.local/share/friction/app/install.sh --uninstall
 ```
 
-This removes the links, the hook entries and the services. Your database is left in place. Delete
+This removes the links, the hook entries, the services and the downloaded gitleaks. Your database is left in place. Delete
 `~/.local/share/friction` to remove that too.
 
 ## Development
 
 | File | Role |
 |---|---|
-| `friction.py` | database and CLI |
+| `friction.py` | database and CLI (secret scrubbing is delegated to gitleaks) |
 | `friction_hook.py` | Claude Code and Codex hook |
 | `backfill.py` | transcript mining |
 | `jev.py` | optional Jev (TypeSafe) classifier client |

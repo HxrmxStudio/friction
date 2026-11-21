@@ -146,41 +146,141 @@ MIGRATIONS = [
     # Workarounds written before verification existed (by agents, the analyser, or teammates via
     # the tracker) are all untrusted: hide every one from SessionStart until someone reviews it.
     "UPDATE items SET verified=0 WHERE workaround != ''",
+    # Computed from the raw command at PreToolUse, because the stored summary is scrubbed later
+    # (and NULL until then): 2 = `friction log|bump|timeline`, 1 = any other friction subcommand.
+    'ALTER TABLE events ADD COLUMN self_call INTEGER NOT NULL DEFAULT 0',
 ]
 DIRTY_STATS = 1      # hit count or time wasted changed
 DIRTY_CONTENT = 2    # title, detail, workaround or fix note changed
 DIRTY_STATUS = 4     # opened, resolved, wontfix or merged
 
-SECRET_PATTERNS = [
-    (re.compile(r'\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
-                r'|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})'), '[REDACTED]'),
-    (re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'), '[REDACTED_JWT]'),
-    (re.compile(r'(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}'), r'\1 [REDACTED]'),
-    (re.compile(r'(?i)([A-Za-z0-9_-]*(?:token|secret|passwd|password|api[_-]?key|access[_-]?key|authorization)'
-                r'[A-Za-z0-9_-]*)(["\']?\s*[:=]\s*["\']?)([^\s"\'&]{6,})'), r'\1\2[REDACTED]'),
-    (re.compile(r'(://[^/\s:@]+):[^@\s/]+@'), r'\1:[REDACTED]@'),
-]
-
 STOPWORDS = set('a an and are as at be but by for from has have i in is it its not of on or so that the '
                 'this to was when with while after before then than into no'.split())
 
 
-def redact(text, limit=SUMMARY_MAX):
-    """Scrub obvious secrets, collapse whitespace runs, truncate."""
-    if text is None:
+# ---- secret scrubbing: gitleaks does it, friction has no scrubber of its own ----------------
+#
+# Text only reaches the database through redact()/redact_many(), which pipe it through
+# `gitleaks stdin`. If gitleaks is missing, slow or broken, they return None: no text is
+# stored rather than unscanned text.
+
+GITLEAKS_BIN = Path('~/.local/share/friction/bin/gitleaks')
+GITLEAKS_ARGS = ('stdin', '--no-banner', '--no-color', '--log-level', 'error', '--exit-code', '0',
+                 '--ignore-gitleaks-allow', '--report-format', 'json', '--report-path', '-')
+SCAN_TIMEOUT_S = 3
+SCAN_CHUNK_CHARS = 200_000     # one gitleaks run per this much text (backfill batches big lists)
+MIN_SECRET_LEN = 3             # shorter "secrets" are rule noise: replacing them would mangle text
+_SCAN_CACHE = {}               # (scanner, text) -> redacted text or None; this process only
+
+
+def gitleaks_path():
+    """FRICTION_GITLEAKS, then the installer's copy, then PATH. None if there is no usable binary."""
+    import shutil
+    env = os.environ.get('FRICTION_GITLEAKS')
+    for cand in ([env] if env else [GITLEAKS_BIN.expanduser(), shutil.which('gitleaks')]):
+        if cand and os.access(cand, os.X_OK) and os.path.isfile(cand):
+            return str(cand)
+    return None
+
+
+def scanner_status():
+    """(ok, message). Cheap: does not run the scanner."""
+    path = gitleaks_path()
+    if path:
+        return True, f'gitleaks at {path}'
+    return False, ('gitleaks is not installed, so friction stores no tool-call text (summaries, errors)'
+                   ' or notes. Run friction\'s installer (python3 installer.py) to install it.')
+
+
+def _run_gitleaks(path, text, timeout):
+    """Findings [(secret, rule)] for text, or None if the scan did not complete."""
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GITLEAKS_')}
+    try:
+        proc = subprocess.run((path,) + GITLEAKS_ARGS, input=text.encode('utf-8', 'replace'),
+                              capture_output=True, timeout=timeout, env=env,
+                              cwd=os.path.dirname(os.path.realpath(path)) or '/')
+        if proc.returncode != 0:
+            return None
+        report = json.loads(proc.stdout.decode('utf-8', 'replace') or 'null') or []
+        found = []
+        for f in report:
+            secret = f.get('Secret') or f.get('Match') or ''
+            if len(secret) >= MIN_SECRET_LEN:
+                found.append((secret, f.get('RuleID') or 'secret'))
+        return found
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
         return None
-    if not isinstance(text, str):
-        try:
-            text = json.dumps(text, default=str)
-        except Exception:
-            text = str(text)
-    text = text[:limit * 8]
-    for pat, rep in SECRET_PATTERNS:
-        text = pat.sub(rep, text)
-    text = re.sub(r'[ \t]+', ' ', text).strip()
-    if len(text) > limit:
-        text = text[:limit - 1] + '…'
-    return text
+
+
+def _scan_chunk(path, texts):
+    """Scrub a list of non-empty strings with one gitleaks run. Returns a list, or None on failure."""
+    sep = f'<<friction-sep-{uuid.uuid4().hex}>>'
+    joined = f'\n{sep}\n'.join(texts)
+    found = _run_gitleaks(path, joined, SCAN_TIMEOUT_S + len(joined) / 100_000)
+    if found is None:
+        return None
+    for secret, rule in sorted(set(found), key=lambda f: -len(f[0])):
+        joined = joined.replace(secret, f'[REDACTED:{rule}]')
+    parts = joined.split(f'\n{sep}\n')
+    return parts if len(parts) == len(texts) else None
+
+
+def redact_many(texts, limit=SUMMARY_MAX):
+    """redact() for several texts with as few gitleaks runs as possible (`limit` may be a list)."""
+    limits = list(limit) if isinstance(limit, (list, tuple)) else [limit] * len(texts)
+    out, todo = [None] * len(texts), []
+    for i, text in enumerate(texts):
+        if text is None:
+            continue
+        if not isinstance(text, str):
+            try:
+                text = json.dumps(text, default=str)
+            except Exception:
+                text = str(text)
+        text = text[:limits[i] * 8]
+        if text.strip():
+            todo.append((i, text))
+        else:
+            out[i] = ''
+    path = gitleaks_path() if todo else None
+    pending = []
+    for i, text in todo:
+        key = (path, limits[i], text)
+        if path and key in _SCAN_CACHE:
+            out[i] = _SCAN_CACHE[key]
+        elif path:
+            pending.append((i, text, key))
+    while pending:
+        chunk, size = [], 0
+        while pending and (not chunk or size + len(pending[0][1]) <= SCAN_CHUNK_CHARS):
+            chunk.append(pending.pop(0))
+            size += len(chunk[-1][1])
+        scrubbed = _scan_chunk(path, [t for _, t, _ in chunk])
+        for n, (i, _, key) in enumerate(chunk):
+            if scrubbed is not None:
+                s = re.sub(r'[ \t]+', ' ', scrubbed[n]).strip()
+                out[i] = s if len(s) <= limits[i] else s[:limits[i] - 1] + '…'
+            if len(_SCAN_CACHE) > 50_000:
+                _SCAN_CACHE.clear()
+            _SCAN_CACHE[key] = out[i]
+    return out
+
+
+def redact(text, limit=SUMMARY_MAX):
+    """Scrub secrets with gitleaks, collapse whitespace runs, truncate.
+
+    None in, None out. None also when the scan could not run: nothing unscanned is returned."""
+    return redact_many([text], [limit])[0]
+
+
+def redact_required(text, limit=SUMMARY_MAX):
+    """redact() for text someone chose to write: refuse, with a reason, if it cannot be scanned."""
+    out = redact(text, limit)
+    if out is None and text is not None:
+        raise ValueError(scanner_status()[1] if not scanner_status()[0]
+                         else 'gitleaks failed or timed out, so the text was not stored')
+    return out
 
 
 def project_of(cwd):
@@ -418,7 +518,7 @@ def retry_flags(events):
     flagged = set()
     for i, a in enumerate(events):
         tool = (a['tool'] or '').lower()
-        if a['ok'] is None or tool in NO_RETRY_TOOLS or is_self_call(a['summary']):
+        if a['ok'] is None or tool in NO_RETRY_TOOLS or a.get('self_call') or is_self_call(a['summary']):
             continue
         for j in range(i + 1, min(len(events), i + 1 + RETRY_LOOKAHEAD)):
             b = events[j]
@@ -459,6 +559,15 @@ ANY_SELF_CALL = re.compile(r'(?:^|[;&|]\s*)(?:python3?\s+)?(?:\S*/)?friction(?:\
 def is_self_call(summary):
     """True for a shell call whose command runs the friction CLI itself."""
     return bool(summary) and bool(ANY_SELF_CALL.search(summary))
+
+
+def self_call_kind(summary):
+    """The events.self_call value for a raw command: 2 log/bump/timeline, 1 other subcommand, 0."""
+    if not summary:
+        return 0
+    if SELF_CALL.search(summary):
+        return 2
+    return 1 if ANY_SELF_CALL.search(summary) else 0
 
 
 class Friction:
@@ -513,12 +622,20 @@ class Friction:
 
     def add_event(self, session_id, kind, tool=None, tool_use_id=None, ok=None, duration_ms=None,
                   summary=None, error=None, ts=None, agent=None, project=None, source='hook',
-                  outcome=None):
+                  outcome=None, defer_scan=False):
+        """Insert an event. defer_scan=True (the hook): store NO text now (error becomes the bare
+        outcome, if any) and let the caller hand the raw text to a scrubber, so no unscanned text
+        is ever written. self_call is always computed from the raw summary."""
+        self_call = self_call_kind(summary)
+        if defer_scan:
+            summary, error = None, outcome
+        else:
+            summary, error = redact_many([summary, error])
         cur = self.db.execute(
             'INSERT INTO events(ts, session_id, agent, project, kind, tool, tool_use_id, ok,'
-            ' duration_ms, summary, error, source, outcome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ' duration_ms, summary, error, source, outcome, self_call) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (ts or time.time(), session_id, agent, project, kind, tool, tool_use_id, ok,
-             duration_ms, redact(summary), redact(error), source, outcome))
+             duration_ms, summary, error, source, outcome, self_call))
         return cur.lastrowid
 
     def flag_retry(self, session_id, event_id):
@@ -529,8 +646,11 @@ class Friction:
         return cur.rowcount > 0
 
     def finish_event(self, session_id, tool, tool_use_id, ok, error=None, duration_ms=None, now=None,
-                     outcome=None):
-        """Close the in-flight event for a tool call. Returns its id, or None if there is none."""
+                     outcome=None, defer_scan=False):
+        """Close the in-flight event for a tool call. Returns its id, or None if there is none.
+
+        Only ok, duration, outcome and error change. defer_scan=True stores the bare outcome (or
+        NULL) as the error; the caller hands the raw text to the scrubber (see scrub_events)."""
         now = now or time.time()
         row = None
         if tool_use_id:
@@ -546,8 +666,33 @@ class Friction:
         if duration_ms is None:
             duration_ms = max(0, int((now - row['ts']) * 1000))
         self.db.execute('UPDATE events SET ok=?, error=?, duration_ms=?, outcome=? WHERE id=?',
-                        (1 if ok else 0, redact(error), duration_ms, outcome, row['id']))
+                        (1 if ok else 0, outcome if defer_scan else redact(error), duration_ms,
+                         outcome, row['id']))
         return row['id']
+
+    def scrub_events(self, items):
+        """Fill in the text of hook events once gitleaks has scanned it (one run for the batch).
+
+        items: dicts with id and any of summary, error (raw text), error_limit, provisional (what
+        the error column holds until then: the bare outcome or NULL). Only text columns are
+        touched, and only while still unscrubbed, so a scrub that lands after PostToolUse (or a
+        retry flag) never overwrites ok, outcome or duration. Returns how many columns were set."""
+        texts, limits = [], []
+        for it in items:
+            texts += [it.get('summary'), it.get('error')]
+            limits += [SUMMARY_MAX, it.get('error_limit', SUMMARY_MAX)]
+        out = redact_many(texts, limits)
+        done = 0
+        for n, it in enumerate(items):
+            summary, error = out[2 * n], out[2 * n + 1]
+            if summary:
+                done += self.db.execute('UPDATE events SET summary=? WHERE id=? AND summary IS NULL',
+                                        (summary, it['id'])).rowcount
+            if error:
+                done += self.db.execute('UPDATE events SET error=? WHERE id=? AND error IS ?',
+                                        (error, it['id'], it.get('provisional'))).rowcount
+        self.db.commit()
+        return done
 
     # ---- time spent waiting on the user ----------------------------------
 
@@ -683,9 +828,9 @@ class Friction:
         now = now or time.time()
         self.last_guess_ambiguous = False
         rows = self.db.execute(
-            "SELECT session_id, summary FROM events WHERE kind='tool' AND ok IS NULL AND ts>?"
-            " AND summary LIKE '%friction%' ORDER BY id DESC", (now - SELF_LOOKUP_S,)).fetchall()
-        found = list(dict.fromkeys(r['session_id'] for r in rows if SELF_CALL.search(r['summary'] or '')))
+            "SELECT session_id FROM events WHERE kind='tool' AND ok IS NULL AND ts>?"
+            ' AND self_call=2 ORDER BY id DESC', (now - SELF_LOOKUP_S,)).fetchall()
+        found = list(dict.fromkeys(r['session_id'] for r in rows))
         if len(found) > 1 and cwd:
             same = [s for s in found if (self.session(s) or {'cwd': None})['cwd'] == cwd]
             if len(same) == 1:
@@ -842,7 +987,8 @@ class Friction:
         now = now or time.time()
         cur = self.db.execute(
             'INSERT INTO items(title, detail, workaround, created, updated, verified) VALUES(?,?,?,?,?,?)',
-            (redact(title, 200), redact(detail, 2000) or '', redact(workaround, 2000) or '', now, now,
+            (redact_required(title, 200), redact_required(detail, 2000) or '',
+             redact_required(workaround, 2000) or '', now, now,
              1 if verified else 0))
         self._index(cur.lastrowid)
         return cur.lastrowid
@@ -874,7 +1020,7 @@ class Friction:
             ' to_explicit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (item_id, ts, session_id, agent, project, wasted, timing,
              win and win['from_event'], win and win['to_event'], win and win['tool_calls'],
-             win and win['failed_calls'], redact(note, 1000) or '', source, regression,
+             win and win['failed_calls'], redact_required(note, 1000) or '', source, regression,
              uuid.uuid4().hex[:16],
              1 if win and (win['to_explicit'] or source == 'backfill') else 0))
         if regression:
@@ -896,7 +1042,7 @@ class Friction:
 
     def set_workaround(self, item_id, text, append=False, now=None):
         item = self.item(item_id)
-        text = redact(text, 2000)
+        text = redact_required(text, 2000)
         if append and item['workaround']:
             text = item['workaround'] + '\n' + text
         # Set by a human or an agent on purpose, so it is trusted (appending to an unverified one
@@ -926,7 +1072,7 @@ class Friction:
                             (now, item['id']))
         else:
             self.db.execute('UPDATE items SET status=?, fix_note=?, resolved_at=?, updated=? WHERE id=?',
-                            (status, redact(note, 2000) or item['fix_note'], now, now, item['id']))
+                            (status, redact_required(note, 2000) or item['fix_note'], now, now, item['id']))
         self.mark_dirty(item['id'], DIRTY_STATUS | DIRTY_CONTENT)
         self.db.commit()
         return item['id']
@@ -1354,6 +1500,39 @@ def cmd_prune(fr, args):
     return 0
 
 
+def cmd_scrub(fr, args):
+    """Internal: the hook pipes {"items": [...]} (raw text) here; gitleaks scans it and the
+    scrubbed text is written to the events. Raw text exists only in this pipe and process."""
+    try:
+        items = json.load(sys.stdin)['items']
+    except (ValueError, KeyError, TypeError):
+        return 1
+    fr.scrub_events(items)
+    return 0
+
+
+def cmd_doctor(fr, args):
+    """Is the secret scanner working? Scans a canary token end to end."""
+    import subprocess
+    ok, msg = scanner_status()
+    print(msg)
+    if not ok:
+        return 1
+    path = gitleaks_path()
+    try:
+        ver = subprocess.run([path, 'version'], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        ver = '?'
+    canary = 'ghp_' + 'aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1gH3jK5'
+    out = redact(f'token {canary}')
+    print(f'version {ver}')
+    if out is None or canary in out:
+        print(f'scan test FAILED (got {out!r}): tool text is not being stored')
+        return 1
+    print('scan test ok')
+    return 0
+
+
 def cmd_backfill(fr, args):
     import backfill
     return backfill.run(fr, args)
@@ -1479,6 +1658,12 @@ def build_parser():
     p = sub.add_parser('prune', help='delete raw tool events past retention (items are kept)')
     p.add_argument('--days', type=int, default=EVENT_RETENTION_DAYS)
     p.set_defaults(fn=cmd_prune)
+
+    p = sub.add_parser('scrub', help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_scrub)
+
+    p = sub.add_parser('doctor', help='check that the gitleaks secret scanner works')
+    p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser('backfill', help='mine past transcripts for friction nobody logged')
     p.add_argument('--since', default='1d', help='how far back to look (2d, 30d, 12h); default 1d')

@@ -285,6 +285,8 @@ def import_events(fr, session, agent, cwd, path, events):
         fr.touch_session(session, agent, cwd, str(path), ts=events[0]['ts'])
         fr.touch_session(session, agent, cwd, str(path), ts=events[-1]['ts'])
     project = fr.session(session)['project'] if events else None
+    # Scan every summary and error in one gitleaks run; the redact() calls below hit its cache.
+    friction.redact_many([v for ev in fresh for v in (ev['summary'], ev['error'])])
     if fresh and first_hook is not None and last is not None:
         renumber(fr, session, fresh, agent, project)   # keep event ids in time order
     else:
@@ -318,6 +320,8 @@ def renumber(fr, session, fresh, agent, project):
                    error=friction.redact(ev['error']), source='transcript')
         if 'outcome' in cols:
             row['outcome'] = ev.get('outcome')
+        if 'self_call' in cols:
+            row['self_call'] = friction.self_call_kind(ev['summary'])
         new.append(row)
     merged = sorted(old + new, key=lambda r: r['ts'])        # stable: old rows keep id order on ties
     fr.db.execute('DELETE FROM events WHERE session_id=?', (session,))
