@@ -26,9 +26,10 @@ friction log "gh auth token expired" --detail "gh calls fail mid-session until r
 
 ## Timing
 
-Wasted time is measured from hook-recorded tool events: from the start of your current failure
-streak to now. If the friction began earlier (or involved no failed call), run `friction timeline`
-and pass `--from <event id>`. Only when no events exist for your session is `--wasted 5m` (your
+Wasted time is measured from hook-recorded tool events: from the first bad call of your latest
+cluster (a failure, or a call marked `SOFT` because it didn't do what you expected) to the end of
+the call that finally worked. If the friction began earlier or ended elsewhere, run
+`friction timeline` and pass `--from <event id>` / `--to <event id>`. Only when no events exist for your session is `--wasted 5m` (your
 estimate) used; those occurrences are flagged as estimated in every report, so always pass it in
 that case rather than leaving the occurrence untimed.
 

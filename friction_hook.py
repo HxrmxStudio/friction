@@ -30,15 +30,18 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from friction import USER_INPUT_TOOLS, Friction, fmt_duration, kick_sync  # noqa: E402
+from friction import (USER_INPUT_TOOLS, WEAK_OUTCOMES, RETRY_LOOKAHEAD, Friction, fmt_duration,  # noqa: E402
+                      is_self_call, kick_sync, redact, retry_flags, unexpected_outcome)
 
 NUDGE_MIN_FAILURES = 2
 SYNC_EVERY_S = 600
 INPUT_KEYS = ('command', 'file_path', 'path', 'pattern', 'url', 'query', 'skill', 'description',
               'prompt', 'subagent_type', 'cmd')
-FAIL_TEXT = re.compile(r'(?i)^\s*(error\b|exit code [1-9]|command failed|permission denied'
-                       r'|process exited with code [1-9])')
-EXIT_CODE = re.compile(r'(?i)\b(?:exit(?:ed)?(?: with)?(?: code)?|exit_code"?)\s*[:=]?\s*(\d+)')
+# Plain-text fallback, only for the shapes the Claude/Codex tool wrappers print: a first line that
+# is `Error: ...` or `Exit code N`, or a last line `Process exited with code N`.
+FAIL_FIRST_LINE = re.compile(r'^\s*(Error:|Exit code:?\s*[1-9]\d*\b)')
+FAIL_LAST_LINE = re.compile(r'(?i)^\s*process exited with code [1-9]\d*\s*$')
+UNVERIFIED_TITLE_MAX = 80
 
 
 def summarize(tool, tool_input):
@@ -85,14 +88,39 @@ def failed(event):
         if isinstance(meta, dict) and isinstance(meta.get('exit_code'), int) and meta['exit_code'] != 0:
             return True, text_of(resp)
         return False, None
+    # Plain text: no structured status, so only trust the wrapper's own shapes. Words like
+    # "error" or "exit code 1" elsewhere are the *content* (test logs, grep hits), not a failure.
     text = text_of(resp)
-    head = text[:300]
-    if FAIL_TEXT.search(head):
-        return True, text
-    m = EXIT_CODE.search(head)
-    if m and m.group(1) != '0':
+    lines = text.strip().splitlines()
+    if lines and (FAIL_FIRST_LINE.match(lines[0]) or FAIL_LAST_LINE.match(lines[-1])):
         return True, text
     return False, None
+
+
+def output_of(resp):
+    """All the output text of a tool response: stdout and stderr together."""
+    if isinstance(resp, dict):
+        parts = [text_of(resp[k]) for k in ('stdout', 'stderr') if resp.get(k)]
+        if parts:
+            return '\n'.join(parts)
+    return text_of(resp)
+
+
+def soft_outcome(event, summary):
+    """(outcome, snippet) for a call that succeeded; outcome None when it did what was expected.
+
+    Weak outcomes (an empty search) are not stored: they only count once a retry follows."""
+    out = output_of(event.get('tool_response'))
+    outcome = unexpected_outcome(event.get('tool_name'), summary, out)
+    if outcome is None or outcome in WEAK_OUTCOMES:
+        return None, None
+    return outcome, redact(' '.join(out.split())[:300], 200) or outcome
+
+
+def safe_title(title):
+    """An unverified (analyser-written) title as shown to agents: short, no markup, one line."""
+    title = re.sub(r'[`\r\n\t]+', ' ', title or '')
+    return re.sub(r' {2,}', ' ', title).strip()[:UNVERIFIED_TITLE_MAX]
 
 
 def start_context(fr):
@@ -107,17 +135,20 @@ def start_context(fr):
     if hot:
         lines.append('Hot friction right now (avoid these; bump the id if you hit one anyway):')
         for row in hot:
-            line = f"  #{row['id']} {row['title']} ({row['n']}x, {fmt_duration(row['wasted'])} wasted)"
-            if row['workaround']:
+            title = row['title'] if row['verified'] else safe_title(row['title'])
+            line = f"  #{row['id']} {title} ({row['n']}x, {fmt_duration(row['wasted'])} wasted)"
+            if row['workaround'] and row['verified']:
                 line += ' — workaround: ' + row['workaround'].replace('\n', ' ')[:200]
+            elif row['workaround']:
+                line += f" — (unverified workaround: run `friction show {row['id']}`)"
             lines.append(line)
     return '\n'.join(lines)
 
 
 def nudge_text(fails):
     tools = ', '.join(dict.fromkeys(ev['tool'] or '?' for ev in fails))
-    return (f'friction: {len(fails)} tool calls failed this session ({tools}) and none were'
-            ' logged. If any of that was real friction (wasted turns, a missing credential, a bad'
+    return (f'friction: {len(fails)} tool calls failed or didn\'t do what you expected this session'
+            f' ({tools}) and none were logged. If any of that was real friction (wasted turns, a missing credential, a bad'
             ' command, a detour), record it now: `friction log "<problem>" --detail "..."`, or'
             ' `friction bump <id>` for a known one; `friction timeline` shows the calls. If it was'
             ' just normal work, ignore this and finish.')
@@ -149,15 +180,35 @@ def handle(event, fr, agent):
     elif name == 'PreToolUse':
         fr.close_waits(session)       # a denied permission prompt never sees a PostToolUse
         sess = fr.session(session)
+        summary = summarize(event.get('tool_name'), event.get('tool_input'))
+        # Is this call a re-run of one of the last few? Then those did not do what was wanted.
+        recent = fr.db.execute(
+            "SELECT * FROM events WHERE session_id=? AND kind='tool' ORDER BY id DESC LIMIT ?",
+            (session, RETRY_LOOKAHEAD)).fetchall()[::-1]
+        seq = [dict(r) for r in recent] + [dict(tool=event.get('tool_name'), summary=redact(summary),
+                                                ok=None, outcome=None, ts=time.time())]
+        for idx in retry_flags(seq):
+            if recent[idx]['ok'] == 1:        # hard failures already count; in-flight ones are ignored
+                fr.flag_retry(session, recent[idx]['id'])
         fr.add_event(session, 'tool', tool=event.get('tool_name'),
-                     tool_use_id=event.get('tool_use_id'),
-                     summary=summarize(event.get('tool_name'), event.get('tool_input')),
+                     tool_use_id=event.get('tool_use_id'), summary=summary,
                      agent=agent, project=sess['project'] if sess else None)
     elif name in ('PostToolUse', 'PostToolUseFailure'):
         bad, error = failed(event)
+        outcome = None
+        summary = summarize(event.get('tool_name'), event.get('tool_input'))
+        if summary is None and event.get('tool_use_id'):      # payload without tool_input
+            row = fr.db.execute('SELECT summary FROM events WHERE session_id=? AND tool_use_id=?'
+                                ' ORDER BY id DESC LIMIT 1', (session, event['tool_use_id'])).fetchone()
+            summary = row['summary'] if row else None
+        if is_self_call(summary):         # e.g. `friction log` exiting 3 to say "bump instead"
+            bad, error = False, None
+        elif not bad:
+            outcome, error = soft_outcome(event, summary)
         fr.close_waits(session, ('permission',))
         done = fr.finish_event(session, event.get('tool_name'), event.get('tool_use_id'),
-                               ok=not bad, error=error, duration_ms=event.get('duration_ms'))
+                               ok=not bad, error=error, duration_ms=event.get('duration_ms'),
+                               outcome=outcome)
         if done is not None and event.get('tool_name') in USER_INPUT_TOOLS:
             start = fr.db.execute('SELECT ts FROM events WHERE id=?', (done,)).fetchone()['ts']
             fr.add_wait(session, event.get('tool_name'), start, time.time())
@@ -165,7 +216,7 @@ def handle(event, fr, agent):
             sess = fr.session(session)
             fr.add_event(session, 'tool', tool=event.get('tool_name'),
                          tool_use_id=event.get('tool_use_id'), ok=0 if bad else 1,
-                         duration_ms=event.get('duration_ms'), error=error,
+                         duration_ms=event.get('duration_ms'), error=error, outcome=outcome,
                          summary=summarize(event.get('tool_name'), event.get('tool_input')),
                          agent=agent, project=sess['project'] if sess else None)
     elif name == 'Stop':

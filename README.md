@@ -102,14 +102,20 @@ friction web          # web view, if the service is not running
 ```
 
 1. **Hooks record raw events.** `PreToolUse` opens an event, `PostToolUse` closes it with success,
-   duration and error text.
+   duration and error text. A call that succeeds but plainly did not do what the agent wanted
+   (a `command not found` or `No such file` line with exit 0, a 401/403 or timeout from a
+   network command, or a near-identical retry with no edit in between) is recorded as a *soft*
+   failure, `SOFT` in timelines, and counts as friction just like a hard failure.
 2. **Agents name the friction.** `friction log` searches existing items first and refuses to create
    a near-duplicate until the agent picks `bump <id>` or `--new`.
 3. **Sessions get nudged.** Each session starts with the hot list. If a session ends with two or
    more failed calls and nothing logged, the agent is asked once whether that was friction.
 4. **Backfill catches the rest.** `friction backfill` reads past transcripts, skips the quiet ones,
    and has a headless `claude -p` on a small model classify the rest. This is the only part that
-   uses the `claude` CLI, and it is optional.
+   uses the `claude` CLI, and it is optional. Items it creates are *unverified*: their workaround
+   came from a model reading tool output, so it is not shown to agents until someone runs
+   `friction verify <id>` or sets the workaround with `friction workaround`. An optional
+   [Jev classifier](#jev-classifier-optional) can do the sorting instead.
 
 For the details (how time is measured, the hot list ranking, backfill, sync, the schema) and
 diagrams of each part, see [How friction works](https://martinwheeler.github.io/friction-docs/).
@@ -141,12 +147,13 @@ Agents run these themselves, guided by the bundled skill. They work just as well
 | `friction search <words>` | is this known? is there a workaround? |
 | `friction hot` | open items hit recently, with workarounds |
 | `friction workaround <id> "..."` | record how to get past an item |
+| `friction verify <id>` | trust a backfill item's workaround so agents are shown it |
 | `friction resolve <id> --fix "..."` | the cause is fixed; a later hit reopens it as a regression |
 | `friction merge <src> <dst>` | fold a duplicate into the canonical item |
 | `friction show <id> --events` | occurrences and the recorded tool calls behind them |
 | `friction timeline` | this session's recent tool calls, with event ids |
 | `friction report [--week\|--month] [--project P] [--agent A] [--json]` | heatmap |
-| `friction backfill --since 30d [--dry-run]` | mine past transcripts |
+| `friction backfill --since 30d [--dry-run] [--classifier claude\|jev] [--jev-check]` | mine past transcripts |
 | `friction web [--port N]` | serve the web view |
 | `friction retime [--dry-run]` | re-measure logged occurrences without time spent waiting on you |
 | `friction sync [--enable\|--disable\|--check\|--dry-run]` | sync items with Jira (off by default) |
@@ -157,10 +164,17 @@ Every occurrence records how its wasted time was obtained, and reports keep the 
 
 | `timing` | Meaning |
 |---|---|
-| `hook` | measured from live hook events, from the start of the failure streak (or `--from <event>`) to the log call |
+| `hook` | measured from live hook events, from the first bad call of the cluster (or `--from <event>`) to the end of the call that finally worked (or `--to <event>`) |
 | `transcript` | measured from transcript timestamps during backfill |
 | `estimate` | the agent's own `--wasted` guess, used only when no events exist. Marked `~est` in the CLI and "estimated" in the web view |
 | `none` | no events and no estimate |
+
+A *bad call* is a hard failure or a soft one. Bad calls group into clusters: a cluster ends when
+the next bad call is over 10 minutes later or more than 3 clean calls intervene. The window
+stops at the *resolution call*, the first clean call after the cluster's last bad call, so the
+productive work done after getting past the problem (and before logging it) is not counted.
+Logging one item marks only its own window, so a second problem in the same session can be
+logged and timed separately.
 
 Measured time leaves out idle gaps (over 5 minutes beyond a call's own run) and any time spent
 waiting on you: from the end of a turn to your next prompt, permission prompts, and questions such
@@ -267,6 +281,10 @@ Unless you enable tracker sync, everything stays on your machine, in
 - The web view is read-only and listens on `127.0.0.1` only.
 - `friction backfill` sends transcript excerpts to the model through your own `claude` CLI. Do not
   enable the timer if you do not want that.
+- The [Jev classifier](#jev-classifier-optional) is off by default. Only if you enable it are
+  cluster excerpts sent to TypeSafe (`api.typesafe.ai`).
+- SessionStart shows only workarounds that are verified (set by an agent or a person), so text an
+  analyser model lifted from tool output is not injected into every later session.
 - [Jira sync](#sync-with-jira) is off by default. If you enable it, items and occurrences are sent
   to your Jira site.
 - Nothing else makes a network request.
@@ -277,6 +295,29 @@ Unless you enable tracker sync, everything stays on your machine, in
 |---|---|
 | `FRICTION_DIR` | where the database lives (default `~/.local/share/friction`) |
 | `FRICTION_DISABLE=1` | switch the hook off for a process tree |
+
+### Jev classifier (optional)
+
+Backfill uses `claude -p` unless you opt in to Jev in `~/.config/friction/classifier.json`
+(the same directory as the tracker config; `FRICTION_CONFIG` moves both):
+
+```json
+{"classifier": "jev",
+ "jev": {"key_file": "~/.config/friction/jev.properties", "model": "jev-1.13.0",
+         "min_confidence": 0.75, "questions_per_request": 2}}
+```
+
+With Jev on, Python splits each session into clusters of bad calls. For each one, Jev answers
+two choice questions: is it friction (or task iteration, probing, noise), and which existing
+item it matches (or `new`). It returns probabilities, so only answers at or above
+`min_confidence` are filed; the rest are counted as `uncertain`. Only clusters that are new
+friction go to `claude -p`, to write the title and workaround. The key is read from
+`jev.key_file` (`apiKey=...`, a bare key, or JSON with `apiKey`); without one, friction uses
+`jev.properties` beside the config, then the TypeSafe key jevgrep saved with `jg auth`
+(`~/.config/jevgrep/credentials.json`). A missing or invalid config
+means the default `claude` flow. `--classifier claude|jev` overrides the config for one run,
+and `friction backfill --jev-check` tests the key with a synthetic request that contains no
+session data.
 
 Hooks are registered for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`,
 `PostToolUse`, `PostToolUseFailure` and `Stop`. The hook exits 0 on any error, so it cannot break an agent session.
@@ -297,6 +338,7 @@ This removes the links, the hook entries and the services. Your database is left
 | `friction.py` | database and CLI |
 | `friction_hook.py` | Claude Code and Codex hook |
 | `backfill.py` | transcript mining |
+| `jev.py` | optional Jev (TypeSafe) classifier client |
 | `web.py`, `web.html` | read-only web view |
 | `tracker.py` | optional sync with an issue tracker (Jira Cloud) |
 | `SKILL.md` | instructions agents load |

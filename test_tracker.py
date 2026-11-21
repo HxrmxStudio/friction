@@ -189,6 +189,13 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual((row['title'], row['workaround']),
                          ('pytest picks the system python', 'use uv run pytest'))
         self.assertEqual(self.a.search('uv run')[0]['id'], item)
+        self.assertEqual(row['verified'], 0)        # edited in the tracker: not shown to agents
+        self.a.db.execute('UPDATE items SET verified=1 WHERE id=?', (item,))
+        self.a.db.commit()
+        self.cfg['trust_workarounds'] = 'true'
+        issue['description'] = tracker.adf_description('system python', 'uv run -m pytest', '', 'x')
+        self.sync(self.a)
+        self.assertEqual(self.a.item(item)['verified'], 1)
 
     def test_offline_changes_wait_and_push_later(self):
         item = self.a.create('aws sso expired', '', '')

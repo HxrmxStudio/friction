@@ -74,6 +74,9 @@ url = https://yoursite.atlassian.net
 email = you@example.com
 project = FRIC
 token_file = ~/.config/friction/jira-token
+# Workarounds written or edited in the tracker are shown to agents only after
+# `friction verify <id>`, unless you trust everyone who can edit these issues:
+trust_workarounds = false
 """
 
 
@@ -244,6 +247,9 @@ class Jira:
         self.project = cfg['project']
         self.issue_type = cfg.get('issue_type') or 'Task'
         self.label = cfg.get('label') or 'friction'
+        # Workarounds edited in the tracker reach every agent's SessionStart context, so they
+        # are unverified (not shown) unless the tracker's editors are trusted.
+        self.trust_workarounds = is_enabled({'enabled': cfg.get('trust_workarounds', '')})
         # Scoped API tokens only work through the api.atlassian.com gateway.
         self.base = (f"https://api.atlassian.com/ex/jira/{cfg['cloud_id']}" if cfg.get('cloud_id')
                      else self.site) + '/rest/api/3'
@@ -354,7 +360,8 @@ def apply_remote(fr, tr, remote, counts):
     item = db.execute('SELECT * FROM items WHERE remote_key=?', (remote['key'],)).fetchone()
     now = time.time()
     if item is None:
-        item_id = fr.create(remote['title'], remote['detail'], remote['workaround'])
+        item_id = fr.create(remote['title'], remote['detail'], remote['workaround'],
+                            verified=getattr(tr, 'trust_workarounds', False) or not remote['workaround'])
         db.execute('UPDATE items SET remote_key=?, remote_url=?, fix_note=? WHERE id=?',
                    (remote['key'], remote['url'], redact(remote['fix'], 2000) or '', item_id))
         item = db.execute('SELECT * FROM items WHERE id=?', (item_id,)).fetchone()
@@ -368,6 +375,8 @@ def apply_remote(fr, tr, remote, counts):
         if fresh != (item['title'], item['detail'], item['workaround'], item['fix_note']) and fresh[0]:
             db.execute('UPDATE items SET title=?, detail=?, workaround=?, fix_note=? WHERE id=?',
                        fresh + (item_id,))
+            if fresh[2] != item['workaround'] and fresh[2] and not getattr(tr, 'trust_workarounds', False):
+                db.execute('UPDATE items SET verified=0 WHERE id=?', (item_id,))
             fr._index(item_id)
             counts['items updated from tracker'] += 1
     if not item['dirty'] & DIRTY_STATUS:
