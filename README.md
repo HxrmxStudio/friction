@@ -301,6 +301,15 @@ Unless you enable tracker sync, everything stays on your machine, in
   not a guarantee. If gitleaks is missing, times out or fails, nothing textual is stored (the call
   is still counted, with no summary or error), `friction log` and the other commands that write text
   refuse, and SessionStart says so. `friction doctor` checks the scanner.
+- The hook does not wait for the scan (gitleaks takes about 0.3 s to start). It records each call
+  with no text, then pipes the raw command and error to a detached `friction scrub` process, which
+  runs gitleaks and fills in the scanned text a moment later. Raw text exists only in that pipe and
+  process memory: never in the database, a file, the command line or the environment.
+- gitleaks' rules target real credential formats (GitHub, AWS, Slack and similar tokens, private
+  keys, auth headers) and use entropy checks. That keeps ordinary text intact, but low-entropy
+  values such as `API_KEY=changeme123`, or a password inside a URL, may not be caught.
+  [How friction works](https://martinwheeler.github.io/friction-docs/#1-hooks-record-every-tool-call)
+  has the details.
 - Raw tool events are deleted after 30 days. Items and occurrences are kept.
 - The web view is read-only and listens on `127.0.0.1` only.
 - `friction backfill` sends transcript excerpts to the model through your own `claude` CLI. Do not
