@@ -174,7 +174,9 @@ the next bad call is over 10 minutes later or more than 3 clean calls intervene.
 stops at the *resolution call*, the first clean call after the cluster's last bad call, so the
 productive work done after getting past the problem (and before logging it) is not counted.
 Logging one item marks only its own window, so a second problem in the same session can be
-logged and timed separately.
+logged and timed separately. The docs walk through
+[a worked example](https://martinwheeler.github.io/friction-docs/#a-worked-example): a session
+whose numbers come out at 46 s under these rules, where the old rule charged 280 s.
 
 Measured time leaves out idle gaps (over 5 minutes beyond a call's own run) and any time spent
 waiting on you: from the end of a turn to your next prompt, permission prompts, and questions such
