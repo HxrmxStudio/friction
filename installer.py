@@ -223,6 +223,10 @@ def launchd_services(args):
             dest.write_bytes(data)
             if not launchctl('bootstrap', domain, str(dest)):
                 say(f'warning  could not load {label}; it will start at next login')
+    # The web view is long-running: restart it so an update's new code is served.
+    if not DRY:
+        launchctl('kickstart', '-k', f'{domain}/{LAUNCHD_WEB}')
+    say(f'restart  {LAUNCHD_WEB}')
     say(f'web view http://127.0.0.1:{args.port}')
 
 
@@ -259,8 +263,10 @@ def services(args):
         systemctl('daemon-reload')
     for name in ENABLE:
         systemctl('enable', '--now', name)
-    if changed:
-        systemctl('restart', 'friction-web.service')
+    # Always: the web view is long-running, so an update's new code is only served after a restart.
+    # (The backfill runs fresh from the timer and the hooks fresh per call; they need nothing.)
+    systemctl('restart', 'friction-web.service')
+    say('restart  friction-web.service')
     say(f'web view http://127.0.0.1:{args.port}')
 
 

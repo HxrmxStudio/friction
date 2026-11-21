@@ -58,6 +58,12 @@ The installer is safe to re-run, and re-running it updates. It:
 
 Steps for an agent you do not have installed are skipped.
 
+**Updating.** Run the same `curl … | bash` again, or `~/.local/share/friction/app/install.sh`:
+it pulls the latest `main`, then re-runs every step above. If you installed from your own checkout,
+`git pull && ./install.sh` in it. Either way the web view is restarted so it serves the new code.
+The hooks and the nightly backfill load the code fresh each time, so they need nothing else, and
+database migrations run on first use.
+
 <details>
 <summary>Options, and installing from a checkout</summary>
 
