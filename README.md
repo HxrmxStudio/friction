@@ -114,7 +114,10 @@ friction web          # web view, if the service is not running
    and has a headless `claude -p` on a small model classify the rest. This is the only part that
    uses the `claude` CLI, and it is optional. Items it creates are *unverified*: their workaround
    came from a model reading tool output, so it is not shown to agents until someone runs
-   `friction verify <id>` or sets the workaround with `friction workaround`. An optional
+   `friction verify <id>` or sets the workaround with `friction workaround`. Workarounds pulled
+   from Jira are unverified too. Upgrading to this version marks *every* existing workaround
+   unverified, since none were reviewed before: run `friction list`, check each with
+   `friction show <id>`, then `friction verify <id>`. An optional
    [Jev classifier](#jev-classifier-optional) can do the sorting instead.
 
 For the details (how time is measured, the hot list ranking, backfill, sync, the schema) and

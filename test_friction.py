@@ -769,11 +769,17 @@ class Migration(unittest.TestCase):
             for sql in friction.MIGRATIONS[:7]:
                 db.execute(sql)
             db.execute('PRAGMA user_version=7')
-            db.execute("INSERT INTO items(title, workaround, created, updated) VALUES('t','w',1,1)")
+            db.execute("INSERT INTO items(title, workaround, created, updated) VALUES('t','run zzwa',1,1)")
+            db.execute("INSERT INTO items(title, workaround, created, updated) VALUES('u','',1,1)")
             db.commit()
             db.close()
             fr = Friction(tmp)
-            self.assertEqual(fr.item(1)['verified'], 1)
+            # every pre-existing workaround is untrusted until reviewed; nothing to hide otherwise
+            self.assertEqual((fr.item(1)['verified'], fr.item(2)['verified']), (0, 1))
+            fr.occur(1, estimate_s=60)
+            context = friction_hook.start_context(fr)
+            self.assertIn('#1', context)
+            self.assertNotIn('zzwa', context)
             self.assertIsNone(fr.db.execute('SELECT outcome FROM events').fetchone())
             self.assertEqual(fr.db.execute('PRAGMA user_version').fetchone()[0], len(friction.MIGRATIONS))
 

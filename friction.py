@@ -143,6 +143,9 @@ MIGRATIONS = [
     # instead of re-deriving the resolution call.
     'ALTER TABLE occurrences ADD COLUMN to_explicit INTEGER NOT NULL DEFAULT 0',
     "UPDATE occurrences SET to_explicit=1 WHERE source='backfill' AND to_event IS NOT NULL",
+    # Workarounds written before verification existed (by agents, the analyser, or teammates via
+    # the tracker) are all untrusted: hide every one from SessionStart until someone reviews it.
+    "UPDATE items SET verified=0 WHERE workaround != ''",
 ]
 DIRTY_STATS = 1      # hit count or time wasted changed
 DIRTY_CONTENT = 2    # title, detail, workaround or fix note changed
