@@ -194,9 +194,29 @@ def flush_scrub(fr, items):
         pass
 
 
+STR_FIELDS = ('hook_event_name', 'session_id', 'thread_id', 'tool_name', 'tool_use_id', 'cwd',
+              'transcript_path', 'agent_id', 'source')
+DURATION_MAX_MS = 7 * 86400 * 1000
+
+
+def clean_event(event):
+    """The event with identity fields that are not strings dropped and a sane duration_ms.
+
+    Payloads come from other programs: a list where a session id belongs, or a duration of
+    1e308, must not reach SQLite or the string code below (it would lose the event)."""
+    if not isinstance(event, dict):
+        return {}
+    event = {k: v for k, v in event.items() if k not in STR_FIELDS or isinstance(v, str)}
+    dur = event.get('duration_ms')
+    if dur is not None:
+        ok = isinstance(dur, (int, float)) and not isinstance(dur, bool) and 0 <= dur <= DURATION_MAX_MS
+        event['duration_ms'] = int(dur) if ok else None
+    return event
+
+
 def handle(event, fr, agent):
     pending = []
-    out = handle_event(event, fr, agent, pending)
+    out = handle_event(clean_event(event), fr, agent, pending)
     flush_scrub(fr, pending)
     return out
 

@@ -1705,15 +1705,19 @@ SYNC_AFTER = {'log', 'bump', 'workaround', 'verify','resolve', 'wontfix', 'reope
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    fr = None
     try:
         fr = Friction()
         code = args.fn(fr, args)
         if args.cmd in SYNC_AFTER:
             kick_sync()
         return code
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, OverflowError) as exc:    # OverflowError: an id past SQLite's range
         print(f'friction: {exc.args[0] if exc.args else exc}', file=sys.stderr)
         return 1
+    finally:
+        if fr is not None:
+            fr.db.close()       # rolls back a half-done write instead of holding the lock
 
 
 if __name__ == '__main__':

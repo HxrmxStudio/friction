@@ -47,7 +47,8 @@ from pathlib import Path
 from friction import DIRTY_CONTENT, DIRTY_STATS, DIRTY_STATUS, fmt_duration, redact
 
 TIMEOUT = 20
-HIT_TOKEN = re.compile(r'\[friction:hit ([^\]]+)\]')
+# One line, and the last one in the comment: the note above it may quote a token.
+HIT_TOKEN = re.compile(r'\[friction:hit ([^\]\n]+)\]')
 WONTFIX_LABEL = 'friction-wontfix'
 
 
@@ -159,7 +160,8 @@ def hit_text(occ):
     """A comment for one occurrence: a line for people, then a token for other machines."""
     how = {'hook': 'measured', 'transcript': 'measured from transcript',
            'estimate': 'estimated by the agent'}.get(occ['timing'])
-    head = f"Hit by {occ['agent'] or 'an agent'} in {occ['project'] or 'an unknown project'}"
+    one_line = lambda s: ' '.join((s or '').split())     # the head must stay the first line
+    head = f"Hit by {one_line(occ['agent']) or 'an agent'} in {one_line(occ['project']) or 'an unknown project'}"
     head += f": {fmt_duration(occ['wasted_s'])} wasted ({how})" if how else ': not timed'
     fields = {'uid': occ['uid'], 'ts': int(occ['ts']), 'timing': occ['timing'],
               'wasted': '' if occ['wasted_s'] is None else int(occ['wasted_s']),
@@ -169,7 +171,9 @@ def hit_text(occ):
 
 
 def parse_hit(text):
-    m = HIT_TOKEN.search(text or '')
+    m = None
+    for m in HIT_TOKEN.finditer(text or ''):
+        pass
     if not m:
         return None
     hit = {k: urllib.parse.unquote(v) for k, _, v in (p.partition('=') for p in m.group(1).split())}
@@ -201,10 +205,12 @@ def adf_text(node):
     if not isinstance(node, dict):
         return ''
     if node.get('type') == 'text':
-        return node.get('text', '')
+        text = node.get('text')
+        return text if isinstance(text, str) else ''
     if node.get('type') == 'hardBreak':
         return '\n'
-    parts = [adf_text(child) for child in node.get('content') or []]
+    content = node.get('content')
+    parts = [adf_text(child) for child in (content if isinstance(content, list) else [])]
     return ('\n' if node.get('type') in ('doc', 'bulletList', 'orderedList') else '').join(parts)
 
 
@@ -222,7 +228,10 @@ def parse_description(doc):
     """-> {'detail', 'workaround', 'fix', 'footer'} from a description we (or a person) wrote."""
     parts = {'detail': [], 'workaround': [], 'fix': [], 'footer': []}
     section = 'detail'
-    for node in (doc or {}).get('content') or []:
+    content = doc.get('content') if isinstance(doc, dict) else None
+    for node in content if isinstance(content, list) else []:
+        if not isinstance(node, dict):
+            continue
         kind = node.get('type')
         if kind == 'heading':
             name = adf_text(node).strip().lower()

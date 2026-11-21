@@ -20,7 +20,7 @@ jobs:
         run: |
           python -c "import installer, sys; sys.exit(0 if installer.install_gitleaks() else 1)"
           python friction.py doctor
-      - run: python -m unittest test_friction test_tracker
+      - run: python -m unittest test_friction test_tracker test_backfill
       - run: python installer.py --dry-run --no-services
       - name: Real install with launchd services (macOS)
         if: runner.os == 'macOS'

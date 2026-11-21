@@ -719,5 +719,49 @@ class Classifier(Base):
         self.assertIn('Jev HTTP 401', out.getvalue())
 
 
+class FuzzRegressions(unittest.TestCase):
+    """Transcript lines the fuzz suite (fuzz/) found crashing a whole session's parse."""
+
+    def parse(self, fn, lines):
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as fh:
+            fh.write('\n'.join(json.dumps(x) if not isinstance(x, str) else x for x in lines))
+        try:
+            return fn(Path(fh.name))
+        finally:
+            os.unlink(fh.name)
+
+    def test_claude_odd_lines(self):
+        ts = '2025-06-15T10:00:00Z'
+        session, _, events = self.parse(backfill.parse_claude, [
+            '"user"', '["assistant"]',
+            {'type': 'user', 'message': 'just text', 'timestamp': ts},
+            {'type': 'assistant', 'timestamp': ts, 'sessionId': ['x'],
+             'message': {'content': [{'type': 'tool_use', 'id': ['bad'], 'name': 'Bash', 'input': {}}]}},
+            {'type': 'assistant', 'timestamp': ts, 'sessionId': 'ok',
+             'message': {'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash', 'input': {'command': 'ls'}}]}},
+            {'type': 'user', 'timestamp': ts, 'message': {'content': [
+                {'type': 'tool_result', 'tool_use_id': ['t1'], 'content': 'x'},
+                {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'}]}},
+        ])
+        self.assertEqual(session, 'ok')
+        self.assertEqual([e['tool_use_id'] for e in events], ['t1'])
+
+    def test_codex_odd_lines(self):
+        ts = '2025-06-15T10:00:00Z'
+        session, _, events = self.parse(backfill.parse_codex, [
+            '"x"', '[1]',
+            {'type': 'session_meta', 'payload': {'id': 'cx', 'cwd': 7}},
+            {'type': 'response_item', 'timestamp': ts,
+             'payload': {'type': 'function_call', 'name': 'shell', 'call_id': ['c'], 'arguments': '{}'}},
+            {'type': 'response_item', 'timestamp': ts,
+             'payload': {'type': 'function_call_output', 'call_id': ['c'], 'output': 'x'}},
+        ])
+        self.assertEqual((session, events), ('cx', []))
+
+    def test_reply_result_not_a_string(self):
+        with self.assertRaises(RuntimeError):
+            backfill.parse_reply({'structured_output': None, 'result': [None]})
+
+
 if __name__ == '__main__':
     unittest.main()

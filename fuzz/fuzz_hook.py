@@ -43,7 +43,7 @@ class HookMachine(RuleBasedStateMachine):
         if out is not None:
             assert isinstance(out, dict), out
             json.dumps(out)               # main() prints it: must serialise
-        if event.get('session_id'):
+        if isinstance(event.get('session_id'), str) and event['session_id']:
             self.sessions.add(event['session_id'])
         return out
 

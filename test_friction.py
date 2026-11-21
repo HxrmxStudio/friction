@@ -1074,5 +1074,29 @@ class Migration(unittest.TestCase):
             self.assertEqual(fr.db.execute('PRAGMA user_version').fetchone()[0], len(friction.MIGRATIONS))
 
 
+class FuzzRegressions(Base):
+    """Inputs the fuzz suite (fuzz/) found crashing; kept here so they need no Hypothesis."""
+
+    def test_hook_ignores_wrong_typed_fields(self):
+        for ev in ({'hook_event_name': 'PreToolUse', 'session_id': [None]},
+                   {'hook_event_name': 'PreToolUse', 'session_id': 's', 'tool_name': ['Bash'], 'cwd': {}},
+                   {'hook_event_name': ['Stop'], 'session_id': 's'}, ['not', 'a', 'dict']):
+            friction_hook.handle(ev, self.fr, 'claude')
+
+    def test_hook_drops_out_of_range_duration(self):
+        for dur in (2**63, -5, 1e308, float('inf'), 'slow', True):
+            friction_hook.handle({'hook_event_name': 'PostToolUse', 'session_id': 's', 'tool_name': 'Bash',
+                                  'tool_input': {'command': 'ls'}, 'tool_response': '', 'duration_ms': dur,
+                                  'tool_use_id': f'x{dur}'}, self.fr, 'claude')
+        rows = self.fr.db.execute("SELECT duration_ms FROM events WHERE kind='tool'").fetchall()
+        self.assertEqual([r['duration_ms'] for r in rows], [None] * 6)
+        self.assertIn('friction', friction_hook.start_context(self.fr))
+
+    def test_cli_id_past_sqlite_range(self):
+        with mock.patch.dict('os.environ', {'FRICTION_DIR': self.tmp.name}), \
+                mock.patch('sys.stderr', new_callable=lambda: __import__('io').StringIO()):
+            self.assertEqual(friction.main(['show', '9' * 30]), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

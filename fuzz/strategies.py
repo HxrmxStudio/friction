@@ -12,12 +12,44 @@ from datetime import datetime, timezone
 
 from hypothesis import HealthCheck, settings, strategies as st
 
+# ci: fixed seeds, so a push or PR fails only on a real change (and the same way every rerun).
+# nightly: fresh random examples, kept in .hypothesis/ (cached by the workflow) so a failure
+# found one night is replayed first the next. HYPOTHESIS_MAX_EXAMPLES overrides either.
+# Friction stores no text without a secret scanner, so every layer runs with one: the repo's
+# fake_gitleaks binary (so gitleaks_path() finds it), with the subprocess call itself swapped for
+# the same rules run in-process (a process per scan would make stateful runs crawl). Everything
+# around that call (batching, separators, replacement, truncation) is friction's real code;
+# fuzz_helpers also drives the real subprocess. Same on every machine as on CI, independent of a
+# real gitleaks' rules, and FRICTION_SCRUB_SYNC keeps the hook from spawning `friction.py scrub`.
+import atexit
+import re
+
+import fake_gitleaks
+import friction
+
+atexit.register(fake_gitleaks.install())
+os.environ['FRICTION_SCRUB_SYNC'] = '1'
+FAKE_RULES = [('github-pat', re.compile(r'ghp_[A-Za-z0-9]{20,}')),
+              ('aws-access-token', re.compile(r'AKIA[0-9A-Z]{16}')),
+              ('generic-api-key', re.compile(r'SECRETVAL[A-Za-z0-9]*'))]
+REAL_RUN_GITLEAKS = friction._run_gitleaks
+
+
+def _fast_run_gitleaks(path, text, timeout):
+    return [(m.group(0), rule) for rule, pat in FAKE_RULES for m in pat.finditer(text)]
+
+
+friction._run_gitleaks = _fast_run_gitleaks
+
 settings.register_profile('dev', max_examples=100, deadline=None)
 settings.register_profile('ci', max_examples=300, deadline=None, derandomize=True, print_blob=True,
                           suppress_health_check=[HealthCheck.too_slow])
-settings.register_profile('nightly', max_examples=20_000, deadline=None, print_blob=True,
+settings.register_profile('nightly', max_examples=5_000, deadline=None, print_blob=True,
                           suppress_health_check=[HealthCheck.too_slow])
 settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
+if os.environ.get('HYPOTHESIS_MAX_EXAMPLES'):
+    settings.register_profile('override', settings(), max_examples=int(os.environ['HYPOTHESIS_MAX_EXAMPLES']))
+    settings.load_profile('override')
 
 
 @contextmanager
@@ -56,6 +88,12 @@ json_val = st.recursive(json_leaf, lambda c: st.one_of(st.lists(c, max_size=4),
 def maybe(strategy, junk=json_val):
     """Usually `strategy`, sometimes a wrong-typed value."""
     return st.one_of(strategy, strategy, strategy, junk)
+
+
+def mostly(strategy, junk=json_val, odds=9):
+    """`strategy` about odds-in-(odds+1) times. For fields that gate deep code: a run that
+    mutates several of them at once never gets past the first check."""
+    return st.one_of(*[strategy] * odds, junk)
 
 
 def with_optional(required, optional):

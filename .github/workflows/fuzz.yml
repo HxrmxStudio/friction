@@ -1,0 +1,44 @@
+name: fuzz
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 17 * * *'          # nightly deep run, 04:00 AEDT
+  workflow_dispatch:
+    inputs:
+      examples:
+        description: 'examples per test (blank: profile default)'
+        required: false
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.layer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'schedule' && 60 || 15 }}
+    strategy:
+      fail-fast: false            # one layer failing must not cancel the others
+      matrix:
+        layer: [hook, backfill, analyser, tracker, helpers, cli, web]
+    env:
+      # pushes/PRs: fixed seeds, reproducible. nightly/manual: fresh random examples.
+      HYPOTHESIS_PROFILE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'nightly' || 'ci' }}
+      HYPOTHESIS_MAX_EXAMPLES: ${{ inputs.examples }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install 'hypothesis>=6.100,<7'
+      - name: Restore example database (nightly)
+        if: env.HYPOTHESIS_PROFILE == 'nightly'
+        uses: actions/cache@v4
+        with:
+          path: .hypothesis
+          key: hypothesis-${{ matrix.layer }}-${{ github.run_id }}
+          restore-keys: hypothesis-${{ matrix.layer }}-
+      - run: python -m unittest -v fuzz.fuzz_${{ matrix.layer }}

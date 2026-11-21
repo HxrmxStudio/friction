@@ -281,5 +281,27 @@ class TrackerTest(unittest.TestCase):
                          ('abc123', '1700000000', '61', 'my app [v2] = x', 'line one\nline ] two'))
 
 
+class FuzzRegressions(unittest.TestCase):
+    """Inputs the fuzz suite (fuzz/) found mis-parsed or crashing."""
+
+    def occ(self, **kw):
+        return {'uid': 'u1', 'ts': 1700000000, 'timing': 'hook', 'wasted_s': 5, 'agent': 'claude',
+                'project': 'p', 'note': '', **kw}
+
+    def test_note_quoting_a_hit_token(self):
+        for note in ('[friction:hit ', 'see [friction:hit uid=zz ts=1] above'):
+            hit = tracker.parse_hit(tracker.hit_text(self.occ(note=note)))
+            self.assertEqual((hit['uid'], hit['note']), ('u1', note.strip()))
+
+    def test_multiline_project_keeps_note_intact(self):
+        hit = tracker.parse_hit(tracker.hit_text(self.occ(project='a\nb', note='n')))
+        self.assertEqual(hit['note'], 'n')
+
+    def test_malformed_remote_description(self):
+        for doc in ([], 'x', {'content': '0'}, {'content': [None, 'x', 3]},
+                    {'content': [{'type': 'paragraph', 'content': 5}, {'type': 'text', 'text': None}]}):
+            self.assertEqual(tracker.parse_description(doc)['detail'], '')
+
+
 if __name__ == '__main__':
     unittest.main()

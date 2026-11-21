@@ -96,7 +96,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == '/api/item':
                 return self.send(200, json.dumps(item_payload(fr, int(q['id']))), 'application/json')
             self.send(404, 'not found', 'text/plain')
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, OverflowError) as exc:    # OverflowError: id past SQLite's range
             self.send(400, str(exc), 'text/plain')
         except Exception as exc:
             self.send(500, str(exc), 'text/plain')

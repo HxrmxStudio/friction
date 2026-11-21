@@ -77,6 +77,11 @@ Prefer an existing item_id over a new title whenever the root cause is the same.
 the problem class, not this instance. Never include secrets. If nothing is real friction, output []."""
 
 
+def _str(x):
+    """x if it is a non-empty string, else None: transcript fields can hold any JSON value."""
+    return x if isinstance(x, str) and x else None
+
+
 def iso_ts(text):
     try:
         return datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
@@ -98,10 +103,11 @@ def parse_claude(path):
                 d = json.loads(line)
             except ValueError:
                 continue
-            if d.get('type') not in ('user', 'assistant'):
+            if not isinstance(d, dict) or d.get('type') not in ('user', 'assistant'):
                 continue
             ts = iso_ts(d.get('timestamp'))
-            content = (d.get('message') or {}).get('content')
+            msg = d.get('message')
+            content = msg.get('content') if isinstance(msg, dict) else None
             if (d['type'] == 'user' and ts and last_ts and not d.get('isMeta')
                     and not d.get('isCompactSummary') and not d.get('isSidechain')
                     and is_prompt(content)):
@@ -109,19 +115,19 @@ def parse_claude(path):
             last_ts = ts or last_ts
             if not isinstance(content, list):
                 continue
-            session = session or d.get('sessionId') or d.get('session_id')
-            cwd = cwd or d.get('cwd')
+            session = session or _str(d.get('sessionId')) or _str(d.get('session_id'))
+            cwd = cwd or _str(d.get('cwd'))
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                if block.get('type') == 'tool_use' and ts:
+                if block.get('type') == 'tool_use' and ts and _str(block.get('id')):
                     calls[block.get('id')] = {
-                        'ts': ts, 'tool': block.get('name'), 'tool_use_id': block.get('id'),
+                        'ts': ts, 'tool': _str(block.get('name')), 'tool_use_id': block.get('id'),
                         'summary': summarize(block.get('name'), block.get('input')),
                         'ok': None, 'error': None, 'duration_ms': None}
                     order.append(block.get('id'))
                 elif block.get('type') == 'tool_result':
-                    call = calls.get(block.get('tool_use_id'))
+                    call = calls.get(_str(block.get('tool_use_id')))
                     if not call:
                         continue
                     bad = bool(block.get('is_error'))
@@ -196,11 +202,11 @@ def parse_codex(path):
                 d = json.loads(line)
             except ValueError:
                 continue
-            p = d.get('payload')
+            p = d.get('payload') if isinstance(d, dict) else None
             if not isinstance(p, dict):
                 continue
             if d.get('type') == 'session_meta':
-                session, cwd = p.get('session_id') or p.get('id'), p.get('cwd')
+                session, cwd = _str(p.get('session_id')) or _str(p.get('id')), _str(p.get('cwd'))
                 continue
             kind, ts = p.get('type'), iso_ts(d.get('timestamp'))
             if d.get('type') == 'event_msg' and ts:
@@ -210,19 +216,20 @@ def parse_codex(path):
                     waits.append(wait_event('prompt', idle_since, ts))
                     idle_since = None
                 continue
-            if kind in ('function_call', 'custom_tool_call', 'local_shell_call') and ts:
+            if kind in ('function_call', 'custom_tool_call', 'local_shell_call') and ts \
+                    and _str(p.get('call_id')):
                 raw = p.get('arguments') if 'arguments' in p else p.get('input', p.get('action'))
                 try:
                     parsed = json.loads(raw) if isinstance(raw, str) else raw
                 except ValueError:
                     parsed = raw
                 calls[p.get('call_id')] = {
-                    'ts': ts, 'tool': p.get('name') or kind, 'tool_use_id': p.get('call_id'),
+                    'ts': ts, 'tool': _str(p.get('name')) or kind, 'tool_use_id': p.get('call_id'),
                     'summary': summarize(p.get('name'), parsed), 'ok': None, 'error': None,
                     'duration_ms': None}
                 order.append(p.get('call_id'))
             elif kind in ('function_call_output', 'custom_tool_call_output', 'local_shell_call_output'):
-                call = calls.get(p.get('call_id'))
+                call = calls.get(_str(p.get('call_id')))
                 if not call:
                     continue
                 out = p.get('output')
@@ -598,7 +605,8 @@ def parse_reply(reply):
     """The findings value from a `claude -p --output-format json` reply."""
     if reply.get('structured_output') is not None:
         return reply['structured_output']
-    text = (reply.get('result') or '').strip()
+    text = reply.get('result')
+    text = text.strip() if isinstance(text, str) else ''
     try:
         return json.loads(text)
     except ValueError:
