@@ -52,6 +52,20 @@ if os.environ.get('HYPOTHESIS_MAX_EXAMPLES'):
     settings.load_profile('override')
 
 
+def named(name, strategy):
+    """`strategy` with a repr of just `name()`.
+
+    A strategy's repr normally inlines everything it is built from, so the shared ones here
+    (which nest `text`, with its 5 kB sample, dozens of times) reprs run to hundreds of kB.
+    Hypothesis's stateful runner rebuilds the repr of the whole rule set on every filtered rule
+    draw (precondition, empty bundle), i.e. most steps: megabytes per step, and the nightly
+    HookMachine run grew to 10 GB and got the CI runner killed. Draws are unchanged."""
+    def draw_it(draw):
+        return draw(strategy)
+    draw_it.__name__ = draw_it.__qualname__ = name
+    return st.composite(draw_it)()
+
+
 @contextmanager
 def temp_friction():
     """A Friction on a throwaway database."""
@@ -73,16 +87,16 @@ nasty_text = st.sampled_from([
     '"quoted"', "it's", '`backtick`', '$(rm -rf /)', '; DROP TABLE items; --', '%s %d {0}',
     '[friction:hit uid=1 ts=1]', 'null', '{}', '[]', 'NaN', '-1', '0', '1e309',
 ])
-text = st.one_of(any_text, nasty_text)
+text = named('text', st.one_of(any_text, nasty_text))
 short_name = st.text(string.ascii_letters + string.digits + '_-', min_size=1, max_size=12)
 
 # ---- JSON values -----------------------------------------------------------
 
 json_leaf = st.one_of(st.none(), st.booleans(), st.integers(-2**63, 2**63),
                       st.floats(allow_nan=False, allow_infinity=False), text)
-json_val = st.recursive(json_leaf, lambda c: st.one_of(st.lists(c, max_size=4),
+json_val = named('json_val', st.recursive(json_leaf, lambda c: st.one_of(st.lists(c, max_size=4),
                                                        st.dictionaries(text, c, max_size=4)),
-                        max_leaves=12)
+                        max_leaves=12))
 
 
 def maybe(strategy, junk=json_val):
@@ -113,10 +127,10 @@ COMMANDS = ['ls', 'ls missing', 'find . -name x', 'grep -r foo .', 'rg foo', 'ca
             'kubectl get pods', 'python3 -m unittest', 'make', 'cd ~/code/friction && ls',
             'friction log "x" --detail y', 'python3 friction.py bump 3', 'friction timeline',
             'echo hi | grep -q hi', 'ls | head', 'npm test']
-command = st.one_of(st.sampled_from(COMMANDS),
+command = named('command', st.one_of(st.sampled_from(COMMANDS),
                     st.builds(lambda c, n: c.replace('x', str(n)), st.sampled_from(COMMANDS),
                               st.integers(0, 9)),
-                    st.builds(lambda c, t: f'{c} {t}', st.sampled_from(COMMANDS), text))
+                    st.builds(lambda c, t: f'{c} {t}', st.sampled_from(COMMANDS), text)))
 
 OUTPUTS = ['', '(no output)', '(Bash completed with no output)', 'ok', 'No matches found',
            'Found 0 files', 'Error: something broke', 'Exit code 1', 'Exit code: 127\nzsh: command not found: foo',
@@ -125,10 +139,10 @@ OUTPUTS = ['', '(no output)', '(Bash completed with no output)', 'ok', 'No match
            'HTTP/1.1 403 Forbidden', 'Bad credentials', 'curl: (28) Operation timed out',
            'error: 404 Not Found', 'Process exited with code 2', 'context deadline exceeded',
            'token=supersecretvalue123 ghp_abcdefghijklmnopqrstuvwxyz1']
-output = st.one_of(st.sampled_from(OUTPUTS), text,
-                   st.builds(lambda a, b: a + '\n' + b, st.sampled_from(OUTPUTS), text))
+output = named('output', st.one_of(st.sampled_from(OUTPUTS), text,
+                   st.builds(lambda a, b: a + '\n' + b, st.sampled_from(OUTPUTS), text)))
 
-tool_input = st.one_of(
+tool_input = named('tool_input', st.one_of(
     st.fixed_dictionaries({'command': command}, optional={'description': text, 'timeout': st.integers()}),
     st.fixed_dictionaries({'cmd': st.one_of(command, st.lists(text, max_size=4))}),
     st.fixed_dictionaries({'file_path': text}, optional={'old_string': text, 'new_string': text}),
@@ -136,9 +150,9 @@ tool_input = st.one_of(
     st.fixed_dictionaries({'url': text, 'prompt': text}),
     st.dictionaries(text, json_val, max_size=3),
     text, json_val,
-)
+))
 
-tool_response = st.one_of(
+tool_response = named('tool_response', st.one_of(
     output,
     with_optional({}, {'stdout': output, 'stderr': output, 'exit_code': st.integers(-1, 255),
                        'exitCode': st.integers(-1, 255), 'is_error': st.booleans(),
@@ -147,7 +161,7 @@ tool_response = st.one_of(
                        'error': output, 'content': output}),
     st.lists(with_optional({'type': st.just('text')}, {'text': output}), max_size=3),
     json_val,
-)
+))
 
 # ---- timestamps ------------------------------------------------------------
 
