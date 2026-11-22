@@ -734,6 +734,57 @@ def cluster_questions(items):
     return qs
 
 
+def last_occurrence_id(fr):
+    return fr.db.execute('SELECT COALESCE(MAX(id), 0) FROM occurrences').fetchone()[0]
+
+
+def record_decision(fr, session, cluster, cfg, kind, match, outcome, item_id):
+    """Keep what Jev said about one cluster, so min_confidence can be judged later."""
+    bad = cluster['bad_ids'][0] if cluster.get('bad_ids') else cluster['from_event']
+    row = fr.db.execute('SELECT summary, error FROM events WHERE id=?', (bad,)).fetchone()
+    summary = ' -> '.join(t for t in (row['summary'], row['error']) if t)[:300] if row else ''
+    fr.db.execute(
+        'INSERT INTO jev_decisions (ts, session_id, from_event, to_event, summary, kind, kind_conf,'
+        ' kind_probs, match, match_conf, min_confidence, model, outcome, item_id)'
+        ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (time.time(), session, cluster['from_event'], cluster['to_event'], summary,
+         kind.choice if kind else None, kind.confidence if kind else None,
+         json.dumps({k: round(v, 3) for k, v in kind.probabilities.items()}) if kind else None,
+         match.choice if match else None, match.confidence if match else None,
+         cfg['min_confidence'], (kind.model if kind else '') or cfg['model'], outcome, item_id))
+
+
+# confidence buckets for `--jev-stats`; the threshold is what min_confidence tunes
+STAT_BUCKETS = ((0.0, 0.5), (0.5, 0.65), (0.65, 0.75), (0.75, 0.85), (0.85, 0.95), (0.95, 1.01))
+
+
+def jev_stats(fr, since=None, examples=8):
+    """Print how Jev's confidence was spread and which clusters sat near the threshold. -> 0"""
+    q = 'SELECT * FROM jev_decisions' + (' WHERE ts >= ?' if since else '') + ' ORDER BY ts'
+    rows = fr.db.execute(q, (since,) if since else ()).fetchall()
+    if not rows:
+        print('No Jev decisions recorded yet (they are kept from the first hybrid backfill run on).')
+        return 0
+    counts = {}
+    for r in rows:
+        counts[r['outcome']] = counts.get(r['outcome'], 0) + 1
+    print(f'{len(rows)} clusters judged by Jev: ' + ', '.join(f'{k}={v}' for k, v in sorted(counts.items())))
+    print('\nkind confidence    friction  other  (no answer: '
+          f"{sum(1 for r in rows if r['kind_conf'] is None)})")
+    for lo, hi in STAT_BUCKETS:
+        inb = [r for r in rows if r['kind_conf'] is not None and lo <= r['kind_conf'] < hi]
+        fric = sum(1 for r in inb if r['kind'] == 'friction')
+        print(f'  {lo:.2f}-{min(hi, 1.0):.2f}       {fric:8d}  {len(inb) - fric:5d}')
+    near = [r for r in rows if r['kind_conf'] is not None and abs(r['kind_conf'] - r['min_confidence']) <= 0.15]
+    if near:
+        print(f'\nNear the threshold (±0.15), most recent {min(examples, len(near))}:')
+        for r in near[-examples:]:
+            item = f" #{r['item_id']}" if r['item_id'] else ''
+            print(f"  {fmt_ts(r['ts'])}  {r['kind']} {r['kind_conf']:.2f} (min {r['min_confidence']:.2f})"
+                  f" -> {r['outcome']}{item}: {(r['summary'] or '')[:90]}")
+    return 0
+
+
 def process_hybrid(fr, session, args, hybrid):
     """Python clusters, Jev classifies each (kind, then match to an existing item), `claude -p`
     only writes up genuinely new problems. -> (filed, status, complete)
@@ -755,10 +806,13 @@ def process_hybrid(fr, session, args, hybrid):
         asked = {'kind': questions['kind']} if per == 1 else questions
         answers = jev.ask(evaluate, asked, state, cfg['model'], per)
         kind = answers.get('kind')
+        match, outcome, item_id = None, None, None
         if kind is None or kind.confidence < cfg['min_confidence']:
             uncertain += 1
+            outcome = 'uncertain'
         elif kind.choice != 'friction':
             skipped += 1
+            outcome = 'skipped'
         else:
             if 'match' in questions and 'match' not in answers:
                 answers.update(jev.ask(evaluate, {'match': questions['match']}, state, cfg['model'], 1))
@@ -771,17 +825,25 @@ def process_hybrid(fr, session, args, hybrid):
                 target = match.choice
             if target is None:
                 uncertain += 1
+                outcome = 'uncertain'
             elif target == 'new':
                 prompt = build_prompt(fr, session, text, nudged_ids(fr, session, scope)) + (
                     '\n\nA classifier judged this cluster to be friction that matches no existing item. '
                     'Report it as one finding (a new item).')
+                before = last_occurrence_id(fr)
                 got = file_findings(fr, session, analyse(prompt, args.model), scope)
                 filed += got
                 unfiled += 0 if got else 1
+                outcome = 'new' if got else 'unfiled'
+                row = fr.db.execute('SELECT item_id FROM occurrences WHERE id > ? ORDER BY id LIMIT 1',
+                                    (before,)).fetchone()
+                item_id = row['item_id'] if row else None
             else:
                 fr.occur(int(target), session_id=session, note=f'jev: friction ({kind.confidence:.2f})',
                          from_event=cluster['from_event'], to_event=cluster['to_event'], source='backfill')
                 filed += 1
+                outcome, item_id = 'matched', int(target)
+        record_decision(fr, session, cluster, cfg, kind, match, outcome, item_id)
         fr.set_mark(session, cluster['to_event'])
         fr.db.commit()
     complete = len(every) <= len(todo)
@@ -822,6 +884,9 @@ def run(fr, args):
     cfg = jev.load_config()
     if getattr(args, 'jev_check', False):
         return jev_check(cfg)
+    if getattr(args, 'jev_stats', False):
+        since = getattr(args, 'since', None)
+        return jev_stats(fr, time.time() - parse_duration(since) if since else None)
     try:
         classifier = resolve_classifier(args, cfg)
     except jev.JevError as exc:
@@ -835,7 +900,7 @@ def run(fr, args):
     if classifier == 'jev':
         hybrid = {'evaluate': jev.evaluator(cfg['key_file']), 'cfg': cfg}
     now = time.time()
-    since_ts = now - parse_duration(args.since)
+    since_ts = now - parse_duration(args.since or '1d')
     current = os.environ.get('CLAUDE_CODE_SESSION_ID')
     candidates = []
     for path, agent, mtime in transcripts(since_ts, now):

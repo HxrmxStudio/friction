@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -623,6 +624,67 @@ class Hybrid(Base):
         filed, status, _ = backfill.process_hybrid(self.fr, 's', self.args(), self.hybrid(lambda req: {'answers': {}}))
         self.assertEqual(filed, 0)
         self.assertIn('uncertain=1', status)
+
+    def decisions(self):
+        return [dict(r) for r in self.fr.db.execute('SELECT * FROM jev_decisions ORDER BY id')]
+
+    def test_decisions_recorded_per_outcome(self):
+        self.setup_session()
+        item = self.fr.create('gh auth token expired')
+        cases = [(FakeJev(kind=('friction', 0.5)), 'uncertain', None),
+                 (FakeJev(kind=('probe', 0.97)), 'skipped', None),
+                 (FakeJev(match=(str(item), 0.4)), 'uncertain', None),
+                 (FakeJev(match=(str(item), 0.9)), 'matched', item)]
+        for fake, outcome, item_id in cases:
+            self.fr.db.execute('UPDATE sessions SET mark_event=0')
+            backfill.process_hybrid(self.fr, 's', self.args(), self.hybrid(fake))
+            row = self.decisions()[-1]
+            self.assertEqual((row['outcome'], row['item_id']), (outcome, item_id), fake.kind)
+            self.assertEqual(row['min_confidence'], 0.75)
+            self.assertIn('token expired', row['summary'])
+        rows = self.decisions()
+        self.assertEqual([r['kind_conf'] for r in rows], [0.5, 0.97, 0.95, 0.95])
+        self.assertEqual(json.loads(rows[1]['kind_probs'])['probe'], 1.0)
+        self.assertEqual((rows[2]['match'], rows[2]['match_conf']), (str(item), 0.4))
+        self.assertIsNone(rows[0]['match'])
+
+    def test_decision_for_new_item_links_created_item(self):
+        self.setup_session()
+        a = self.fr.clusters('s')[0]['from_event']
+        with mock.patch.object(backfill, 'analyse', lambda p, m: [finding(from_event=a, to_event=a, title='brand new')]):
+            backfill.process_hybrid(self.fr, 's', self.args(), self.hybrid(FakeJev()))
+        row = self.decisions()[-1]
+        new = self.fr.db.execute("SELECT id FROM items WHERE title='brand new'").fetchone()['id']
+        self.assertEqual((row['outcome'], row['item_id']), ('new', new))
+        with mock.patch.object(backfill, 'analyse', lambda p, m: []):
+            self.fr.db.execute('UPDATE sessions SET mark_event=0')
+            backfill.process_hybrid(self.fr, 's', self.args(), self.hybrid(FakeJev()))
+        self.assertEqual((self.decisions()[-1]['outcome'], self.decisions()[-1]['item_id']), ('unfiled', None))
+
+    def test_invalid_answer_recorded_without_kind(self):
+        self.setup_session()
+        backfill.process_hybrid(self.fr, 's', self.args(), self.hybrid(lambda req: {'answers': {}}))
+        row = self.decisions()[-1]
+        self.assertEqual((row['outcome'], row['kind'], row['kind_conf']), ('uncertain', None, None))
+
+    def test_jev_stats_report(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            backfill.jev_stats(self.fr)
+        self.assertIn('No Jev decisions', out.getvalue())
+        self.setup_session()
+        backfill.process_hybrid(self.fr, 's', self.args(), self.hybrid(FakeJev(kind=('friction', 0.7))))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(backfill.jev_stats(self.fr), 0)
+        text = out.getvalue()
+        self.assertIn('1 clusters judged by Jev: uncertain=1', text)
+        self.assertIn('0.65-0.75              1      0', text)
+        self.assertIn('friction 0.70 (min 0.75) -> uncertain: ', text)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            backfill.jev_stats(self.fr, since=time.time() + 60)
+        self.assertIn('No Jev decisions', out.getvalue())
 
     def test_item_list_capped(self):
         self.setup_session()

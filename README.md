@@ -167,7 +167,7 @@ Agents run these themselves, guided by the bundled skill. They work just as well
 | `friction show <id> --events` | occurrences and the recorded tool calls behind them |
 | `friction timeline` | this session's recent tool calls, with event ids |
 | `friction report [--week\|--month] [--project P] [--agent A] [--json]` | heatmap |
-| `friction backfill --since 30d [--dry-run] [--classifier claude\|jev] [--jev-check]` | mine past transcripts |
+| `friction backfill --since 30d [--dry-run] [--classifier claude\|jev] [--jev-check] [--jev-stats]` | mine past transcripts |
 | `friction web [--port N]` | serve the web view |
 | `friction retime [--dry-run]` | re-measure logged occurrences without time spent waiting on you |
 | `friction sync [--enable\|--disable\|--check\|--dry-run]` | sync items with Jira (off by default) |
@@ -358,6 +358,13 @@ friction go to `claude -p`, to write the title and workaround. The key is read f
 means the default `claude` flow. `--classifier claude|jev` overrides the config for one run,
 and `friction backfill --jev-check` tests the key with a synthetic request that contains no
 session data.
+
+Every cluster Jev judges is recorded in the `jev_decisions` table: the `kind` answer, its
+confidence and probabilities, the `match` answer, the threshold in force, the outcome
+(`uncertain`, `skipped`, `matched`, `new`, `unfiled`), the item it went to, and a short
+redacted summary of the first bad call. `friction backfill --jev-stats [--since 30d]` prints
+how the confidences are spread and lists the clusters that sat within 0.15 of the threshold,
+so you can decide from real runs whether `min_confidence` is too strict or too loose.
 
 Hooks are registered for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`,
 `PostToolUse`, `PostToolUseFailure` and `Stop`. The hook exits 0 on any error, so it cannot break an agent session.

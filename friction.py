@@ -149,6 +149,14 @@ MIGRATIONS = [
     # Computed from the raw command at PreToolUse, because the stored summary is scrubbed later
     # (and NULL until then): 2 = `friction log|bump|timeline`, 1 = any other friction subcommand.
     'ALTER TABLE events ADD COLUMN self_call INTEGER NOT NULL DEFAULT 0',
+    # One row per cluster the Jev classifier judged, kept so min_confidence can be tuned
+    # (`friction backfill --jev-stats`). outcome: uncertain | skipped | matched | new | unfiled.
+    # summary is the first bad call's stored (already scrubbed) summary and error, since events
+    # get pruned.
+    'CREATE TABLE IF NOT EXISTS jev_decisions (id INTEGER PRIMARY KEY, ts REAL NOT NULL,'
+    ' session_id TEXT, from_event INTEGER, to_event INTEGER, summary TEXT,'
+    ' kind TEXT, kind_conf REAL, kind_probs TEXT, match TEXT, match_conf REAL,'
+    ' min_confidence REAL, model TEXT, outcome TEXT NOT NULL, item_id INTEGER)',
 ]
 DIRTY_STATS = 1      # hit count or time wasted changed
 DIRTY_CONTENT = 2    # title, detail, workaround or fix note changed
@@ -1666,7 +1674,7 @@ def build_parser():
     p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser('backfill', help='mine past transcripts for friction nobody logged')
-    p.add_argument('--since', default='1d', help='how far back to look (2d, 30d, 12h); default 1d')
+    p.add_argument('--since', default=None, help='how far back to look (2d, 30d, 12h); default 1d')
     p.add_argument('--dry-run', action='store_true', help='pre-pass only: list suspicious sessions')
     p.add_argument('--limit', type=int, default=40, help='most sessions to send to the analyser')
     p.add_argument('--min-failures', type=int, default=2)
@@ -1676,6 +1684,9 @@ def build_parser():
                    help='override classifier.json (default: claude; jev is opt-in)')
     p.add_argument('--jev-check', action='store_true',
                    help='send a synthetic request to test the Jev key/config (no session data)')
+    p.add_argument('--jev-stats', action='store_true',
+                   help="report Jev's recorded confidence per cluster, to tune min_confidence"
+                   ' (all history unless --since is given)')
     p.set_defaults(fn=cmd_backfill)
 
     p = sub.add_parser('retime', help='re-measure logged occurrences, taking out time spent'
