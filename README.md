@@ -10,7 +10,7 @@
 ![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 ![works with Claude Code and Codex](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex-d97757.svg)
 
-[Install](#install) · [How it works](#how-it-works) · [Docs](https://martinwheeler.github.io/friction-docs/) · [Commands](#commands) · [Jira sync](#sync-with-jira) · [Privacy](#privacy) · [Uninstall](#uninstall)
+[Install](#install) · [How it works](#how-it-works) · [Docs](https://martinwheeler.github.io/friction-docs/) · [Commands](#commands) · [Jira sync](#sync-with-jira) · [Linear sync](#sync-ghidorah-with-linear) · [Privacy](#privacy) · [Uninstall](#uninstall)
 
 <img src="docs/web.png" alt="The friction web view: a heatmap of friction items by day, with time wasted per item, project and agent" width="860">
 
@@ -170,7 +170,7 @@ Agents run these themselves, guided by the bundled skill. They work just as well
 | `friction backfill --since 30d [--dry-run] [--classifier claude\|jev] [--jev-check] [--jev-stats]` | mine past transcripts |
 | `friction web [--port N]` | serve the web view |
 | `friction retime [--dry-run]` | re-measure logged occurrences without time spent waiting on you |
-| `friction sync [--enable\|--disable\|--check\|--dry-run]` | sync items with Jira (off by default) |
+| `friction sync [--enable\|--disable\|--check\|--dry-run]` | sync items with Jira or Ghidorah items with Linear (off by default) |
 
 ### Where the time comes from
 
@@ -296,6 +296,26 @@ switch that `--enable` and `--disable` flip; you can also edit it by hand.
 
 </details>
 
+## Sync Ghidorah with Linear
+
+The harness configures Linear in its own Friction instance. Use a local personal API key for the configured Linear workspace. Create a team-scoped `ghidorah` label on HXR before enabling sync.
+
+```ini
+[tracker]
+enabled = false
+type = linear
+workspace = hxrmx
+project = HXR
+label = ghidorah
+token_env = FRICTION_LINEAR_TOKEN
+```
+
+`friction sync --check` checks the workspace, team and label. `friction sync --enable` enables the tracker. You can also supply the key with `token_cmd` or `token_file`.
+
+A Ghidorah item becomes a Linear issue after two distinct sessions hit the same fingerprint, after Emiliano marks an occurrence, or when an occurrence records silent damage. An existing HXR link receives each occurrence as a comment without a new issue. An optional `linked_token_env` or `linked_token_cmd` reads the status of pre-existing MAI links from the Mainder workspace. MAI links are read-only.
+
+Linear owns the issue and its status. A fresh occurrence after an issue was completed reopens it as a regression. A sync retry uses the same issue and comment identifiers. Linear receives the fingerprint and occurrence attribution. Tool payloads, prompts and local event rows stay on the machine.
+
 ## Privacy
 
 Unless you enable tracker sync, everything stays on your machine, in
@@ -387,7 +407,7 @@ This removes the links, the hook entries, the services and the downloaded gitlea
 | `backfill.py` | transcript mining |
 | `jev.py` | optional Jev (TypeSafe) classifier client |
 | `web.py`, `web.html` | read-only web view |
-| `tracker.py` | optional sync with an issue tracker (Jira Cloud) |
+| `tracker.py`, `linear_tracker.py` | optional Jira Cloud or Ghidorah Linear sync |
 | `SKILL.md` | instructions agents load |
 | `installer.py`, `install.sh` | install, update, uninstall |
 

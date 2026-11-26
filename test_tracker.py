@@ -1,15 +1,19 @@
-"""Tracker sync tests against an in-process fake of the Jira Cloud REST API."""
+"""Tracker sync tests against fake Jira and Linear APIs."""
 import json
 import os
 import tempfile
 import threading
 import unittest
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import fake_gitleaks
+import ghidorah
 import tracker
 from friction import Friction
+from linear_tracker import Linear
 
 
 def setUpModule():
@@ -19,6 +23,121 @@ def setUpModule():
 
 def tearDownModule():
     _cleanup()
+
+
+class LinearTest(unittest.TestCase):
+    def test_threshold_pull_and_idempotent_recovery_after_lost_responses(self):
+        team = {'id': 'hxrmx-team', 'key': 'HXR'}
+        backlog = {'id': 'todo', 'type': 'backlog', 'position': 1}
+        state = {'issue': None, 'comments': {}, 'reopened': 0, 'hide_comments': False}
+
+        def graphql(operation, query, **variables):
+            issue = state['issue']
+            comments = state['comments']
+            payload = variables.get('input')
+            if 'issueLabels(' in query:
+                return {
+                    'organization': {'urlKey': 'hxrmx'},
+                    'teams': {'nodes': [dict(team, states={'nodes': [backlog]})]},
+                    'issueLabels': {'nodes': [{'id': 'ghidorah-label', 'team': {'id': team['id']}}],
+                                    'pageInfo': {'hasNextPage': False}},
+                }
+            if 'issues(' in query:
+                page = {'nodes': [] if state['hide_comments'] else list(comments.values()),
+                        'pageInfo': {'hasNextPage': False}}
+                return {'issues': {'nodes': [dict(issue, comments=page)] if issue else [],
+                                   'pageInfo': {'hasNextPage': False}}}
+            if 'comments(' in query:
+                return {'issue': {'comments': {'nodes': list(comments.values()), 'pageInfo': {'hasNextPage': False}}}}
+            if 'issue(id:' in query:
+                return {'issue': issue} if issue else None
+            if 'comment(id:' in query:
+                return {'comment': comments[variables['id']]}
+            if 'issueCreate(' in query:
+                self.assertIsNone(issue, 'a duplicate issue creation reached the server')
+                self.assertEqual(payload['labelIds'], ['ghidorah-label'])
+                state['issue'] = dict(payload, team=team, identifier='HXR-900', archivedAt=None,
+                                      completedAt=None, state=backlog, url='https://linear.app/hxrmx/issue/HXR-900')
+            elif 'commentCreate(' in query:
+                if payload['id'] in comments:
+                    raise tracker.TrackerError('comment already exists')
+                comments[payload['id']] = payload
+            elif 'issueUpdate(' in query:
+                self.assertEqual(payload, {'stateId': 'todo'})
+                issue.update(state=backlog, completedAt=None)
+                state['reopened'] += 1
+                return {'issueUpdate': {'success': True, 'issue': issue}}
+            else:
+                self.fail(operation)
+            raise tracker.TrackerError('write response lost')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Friction(Path(tmp) / 'first')
+            second = Friction(Path(tmp) / 'second')
+            third = Friction(Path(tmp) / 'third')
+            self.addCleanup(first.db.close)
+            self.addCleanup(second.db.close)
+            self.addCleanup(third.db.close)
+            for db in (first, second, third):
+                ghidorah.ensure_schema(db)
+            linear = Linear({'type': 'linear', 'token_env': 'UNCONFIGURED_TOKEN'}, token='test-key')
+            fingerprint = 'tool:git:bad-exit'
+            session = str(uuid.uuid4())
+            uid = str(uuid.uuid4())
+
+            def hit(db, where, machine, when, occurrence=None, **flags):
+                return ghidorah.record(
+                    db, fingerprint=fingerprint, uid=occurrence or str(uuid.uuid4()), session=where,
+                    machine=machine, account='codex', engine='codex', ts=when, **flags,
+                )
+
+            def sync(db):
+                self.assertEqual(tracker.sync(db, linear)[1], [])
+
+            with patch.object(linear.api, 'call', side_effect=graphql):
+                item = hit(first, session, 'lenovo', 100, uid)
+                hit(first, session, 'lenovo', 200)
+                sync(first)
+                self.assertIsNone(state['issue'])
+                self.assertEqual(state['comments'], {})
+
+                hit(first, str(uuid.uuid4()), 'air', 300)
+                sync(first)
+                sync(first)
+                state['issue']['description'] = 'Descripción editada por una persona.'
+                peer_item = hit(second, session, 'mac', 105, uid, correction=True)
+                state['hide_comments'] = True
+                sync(second)
+                state['hide_comments'] = False
+                self.assertEqual(second.item(peer_item)['remote_key'], 'HXR-900')
+                self.assertEqual(len(state['comments']), 3)
+
+                copy_id = str(uuid.uuid4())
+                state['comments'][copy_id] = dict(next(iter(state['comments'].values())), id=copy_id)
+                with third.db:
+                    alias = ghidorah.ensure_item(third, 'catalog:2026-11-26:40', link='HXR-900', seed=True)
+                sync(third)
+                imported = third.search('bad exit')[0]['id']
+                self.assertEqual(third.item(imported)['remote_key'], 'HXR-900')
+                self.assertEqual((third.stats(imported)['n'], third.stats(alias)['n']), (3, 0))
+                del state['comments'][copy_id]
+                self.assertEqual(len(state['comments']), 3)
+
+                state['issue'].update(state={'type': 'completed'}, completedAt='1970-01-01T00:06:40.000Z')
+                posted_uid = str(uuid.uuid4())
+                posted_id = ghidorah.occurrence_id('linear-comment', state['issue']['id'], posted_uid)
+                state['comments'][posted_id] = {
+                    'id': posted_id,
+                    'body': f'`ghidorah-hit-v2:{fingerprint}:{posted_uid}:{session}:air:codex:codex:1:0:425.000000`',
+                }
+                sync(first)
+                self.assertEqual(first.item(item)['status'], 'resolved')
+                self.assertEqual(state['reopened'], 0)
+                hit(third, session, 'lenovo', 450)
+                sync(third)
+                sync(third)
+                self.assertEqual((third.item(imported)['status'], third.item(alias)['status']), ('open', 'open'))
+                self.assertEqual((state['reopened'], len(state['comments'])), (1, 5))
 
 
 class FakeJira:

@@ -1091,6 +1091,10 @@ class Friction:
         src, dst = self.item(src_id), self.item(dst_id)
         if src['id'] == dst['id']:
             raise ValueError('cannot merge an item into itself')
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='ghidorah_items'").fetchone() and self.db.execute(
+            'SELECT 1 FROM ghidorah_items WHERE item_id IN (?,?)', (src['id'], dst['id']),
+        ).fetchone():
+            raise ValueError('Ghidorah items are grouped by their mechanical fingerprint')
         aliases = '\n'.join(x for x in (dst['aliases'], src['title'], src['aliases']) if x)
         detail = dst['detail'] or src['detail']
         workaround = dst['workaround']

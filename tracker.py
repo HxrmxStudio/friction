@@ -1,4 +1,4 @@
-"""Sync friction items with an external issue tracker (Jira Cloud).
+"""Sync friction items with Jira Cloud or Ghidorah items with Linear.
 
 The local database stays the working copy: hooks, timing, search and the
 heatmap never wait on the network. `friction sync` then makes the tracker the
@@ -127,10 +127,15 @@ def set_enabled(on):
 
 
 def read_token(cfg):
-    token = os.environ.get(cfg.get('token_env') or 'FRICTION_JIRA_TOKEN')
+    default_env = 'FRICTION_LINEAR_TOKEN' if cfg.get('type', '').lower() == 'linear' else 'FRICTION_JIRA_TOKEN'
+    token = os.environ.get(cfg.get('token_env') or default_env)
     if not token and cfg.get('token_cmd'):
-        proc = subprocess.run(cfg['token_cmd'], shell=True, capture_output=True, text=True, timeout=30)
-        token = proc.stdout.strip()
+        try:
+            proc = subprocess.run(cfg['token_cmd'], shell=True, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            raise TrackerError('could not run tracker token command') from None
+        if proc.returncode == 0:
+            token = proc.stdout.strip()
     if not token and cfg.get('token_file'):
         path = Path(cfg['token_file']).expanduser()
         if path.exists():
@@ -142,8 +147,11 @@ def read_token(cfg):
 
 def make_tracker(cfg):
     kind = cfg.get('type', '').lower()
+    if kind == 'linear':
+        from linear_tracker import Linear
+        return Linear(cfg)
     if kind != 'jira':
-        raise TrackerError(f'unknown tracker type {kind!r} (supported: jira)')
+        raise TrackerError(f'unknown tracker type {kind!r} (supported: jira, linear)')
     return Jira(cfg)
 
 
@@ -467,7 +475,10 @@ def push_item(fr, tr, item, counts):
     db.commit()
 
 
-def pending(fr):
+def pending(fr, cfg=None):
+    if cfg and cfg.get('type', '').lower() == 'linear':
+        from linear_tracker import pending as linear_pending
+        return linear_pending(fr)
     db = fr.db
     one = lambda sql: db.execute(sql).fetchone()[0]     # noqa: E731
     return {
@@ -480,6 +491,8 @@ def pending(fr):
 
 def sync(fr, tr):
     """One full pull then push. -> (counts, errors)"""
+    if tr.name == 'Linear':
+        return tr.sync(fr)
     counts, errors = collections.Counter(), []
     started = time.time()
     last = fr.meta('last_pull')
@@ -532,7 +545,7 @@ def enable(fr):
         raise TrackerError(f'{path} still has the template values; fill them in first')
     who = make_tracker(cfg).check()            # raises if the settings or the token are wrong
     set_enabled(True)
-    todo = pending(fr)
+    todo = pending(fr, cfg)
     print(f'Tracker sync is ON. Connected: {who}')
     print('The next `friction sync` will push: ' + ', '.join(f'{n} {k}' for k, n in todo.items()))
     return 0
@@ -564,7 +577,7 @@ def run(fr, args):
         say('Tracker sync is off: items stay in the local database. Turn it on with'
             ' `friction sync --enable`.')
         return 0
-    todo = pending(fr)
+    todo = pending(fr, cfg)
     if args.dry_run:
         print('Would push: ' + ', '.join(f'{n} {k}' for k, n in todo.items()))
         return 0
